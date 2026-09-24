@@ -21,7 +21,30 @@ from isolatevm.workspace_volume import volume_name as workspace_volume_name
 from isolatevm.ui import IsolateApp
 
 app = IsolateApp()
+def poll_until(predicate, callback, description, timeout_ms=5000):
+    deadline = GLib.get_monotonic_time() + timeout_ms * 1000
+    def poll():
+        try:
+            result = predicate()
+            if result is not None:
+                callback(result)
+                return False
+            if GLib.get_monotonic_time() >= deadline:
+                raise AssertionError(f"Timed out waiting for {description}")
+        except BaseException:
+            traceback.print_exc(); os._exit(2)
+        return True
+    GLib.timeout_add(25, poll)
+
+def review_dialog():
+    dialogs = [item for item in Gtk.Window.list_toplevels()
+               if isinstance(item, Gtk.Dialog) and item.get_title().startswith("Revisar alteração")]
+    assert len(dialogs) <= 1
+    return dialogs[0] if dialogs else None
+
 def begin():
+    if app.get_active_window() is None:
+        return True
     try:
         window = app.get_active_window()
         manifest = Manifest.parse({"schemaVersion": 1, "name": "preview-vm",
@@ -33,18 +56,14 @@ def begin():
         window._review_change("preview-vm", "resources",
                               lambda current: diff.resources(current, 4, 4096),
                               lambda: window.service.set_resources("preview-vm", 4, 4096))
-        GLib.timeout_add(450, inspect)
+        poll_until(review_dialog, inspect, "initial review dialog")
     except BaseException:
         traceback.print_exc(); os._exit(2)
     return False
 
-def inspect():
+def inspect(dialog):
     try:
         window = app.get_active_window()
-        dialogs = [item for item in Gtk.Window.list_toplevels()
-                   if isinstance(item, Gtk.Dialog) and item.get_title().startswith("Revisar alteração")]
-        assert len(dialogs) == 1
-        dialog = dialogs[0]
         assert dialog.get_widget_for_response(Gtk.ResponseType.OK).get_label() == "Aplicar alterações"
         labels = []
         def collect(widget):
@@ -62,40 +81,43 @@ def inspect():
         window._review_change("preview-vm", "resources",
                               lambda current: diff.resources(current, 4, 4096),
                               lambda: window.service.set_resources("preview-vm", 4, 4096))
-        GLib.timeout_add(450, inspect_stale)
+        poll_until(review_dialog, inspect_stale, "second review dialog")
     except BaseException:
         traceback.print_exc(); os._exit(2)
     return False
 
-def inspect_stale():
+def inspect_stale(dialog):
     try:
         window = app.get_active_window()
-        dialogs = [item for item in Gtk.Window.list_toplevels()
-                   if isinstance(item, Gtk.Dialog) and item.get_title().startswith("Revisar alteração")]
-        assert len(dialogs) == 1
         window.service.set_resources("preview-vm", 3, 2048)
-        dialogs[0].response(Gtk.ResponseType.OK)
-        GLib.timeout_add(450, finish)
+        dialog.response(Gtk.ResponseType.OK)
+        poll_until(stale_error_dialog, finish, "stale-preview error dialog")
     except BaseException:
         traceback.print_exc(); os._exit(2)
     return False
 
-def finish():
+def stale_error_dialog():
+    dialogs = [item for item in Gtk.Window.list_toplevels()
+               if isinstance(item, Gtk.MessageDialog) and
+               "mudou desde a prévia" in str(item.get_property("text"))]
+    assert len(dialogs) <= 1
+    return dialogs[0] if dialogs else None
+
+def finish(dialog):
     try:
         window = app.get_active_window()
         assert window.service.list_vms()[0].cpu == "3"
-        for dialog in Gtk.Window.list_toplevels():
-            if isinstance(dialog, Gtk.MessageDialog): dialog.destroy()
+        dialog.response(Gtk.ResponseType.OK)
         window.close(); app.quit()
     except BaseException:
         traceback.print_exc(); os._exit(2)
     return False
 
-GLib.timeout_add(300, begin)
+GLib.timeout_add(25, begin)
 app.run([])
 '''
     env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
-    subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=20, env=env)
 
 
 @pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or

@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore IsolateVM restricted-egress firewall before Incus starts
+After=systemd-modules-load.service
+Before=incus.service snap.incus.daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/isolatevm/isolatevm-egress-helper restore-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

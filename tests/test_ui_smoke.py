@@ -6,6 +6,16 @@ import sys
 import pytest
 
 
+def _has_vte_391() -> bool:
+    try:
+        import gi
+        gi.require_version("Vte", "3.91")
+        from gi.repository import Vte
+    except (ImportError, ValueError):
+        return False
+    return Vte is not None
+
+
 @pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
                     not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
                     reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
@@ -331,8 +341,9 @@ app.run([])
 
 
 @pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
-                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
-                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
+                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) or
+                    not _has_vte_391(),
+                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica com VTE 3.91")
 def test_vte_terminal_spawns_fixed_argv_in_a_pty():
     script = '''
 import gi

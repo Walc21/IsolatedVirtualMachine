@@ -36,6 +36,23 @@ from .ui_metrics import MetricsMixin
 from .ui_terminal import TerminalMixin
 
 
+_DESKTOP_SESSION_ENV = (
+    "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+    "XAUTHORITY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+    "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "GDK_BACKEND",
+)
+
+
+def _local_gui_client_environment(service: LocalIncus) -> dict[str, str]:
+    """Keep the local client environment small while preserving desktop launch context."""
+    environment = service.terminal_environment()
+    for key in _DESKTOP_SESSION_ENV:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
 class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application) -> None:
         super().__init__(application=app, title="IsolateVM")
@@ -685,13 +702,10 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
         except Exception as exc: self._toast(str(exc))
 
     def _open_terminal(self, argv: list[str]) -> None:
-        env = os.environ.copy()
         if isinstance(self.service, LocalIncus):
-            env["INCUS_CONF"] = str(self.service.client_config_dir)
-            env.pop("INCUS_REMOTE", None)
-            env.pop("INCUS_SOCKET", None)
-            env.pop("INCUS_DIR", None)
-            env.pop("INCUS_PROJECT", None)
+            env = _local_gui_client_environment(self.service)
+        else:
+            env = os.environ.copy()
         subprocess.Popen(["/usr/bin/xdg-terminal-exec", "--", *argv], close_fds=True, env=env)
 
     def _guest_login(self, name: str) -> None:
@@ -705,13 +719,10 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
     def _console(self, name: str) -> None:
         try:
             argv = self.service.console_argv(name)
-            env = os.environ.copy()
             if isinstance(self.service, LocalIncus):
-                env["INCUS_CONF"] = str(self.service.client_config_dir)
-                env.pop("INCUS_REMOTE", None)
-                env.pop("INCUS_SOCKET", None)
-                env.pop("INCUS_DIR", None)
-                env.pop("INCUS_PROJECT", None)
+                env = _local_gui_client_environment(self.service)
+            else:
+                env = os.environ.copy()
             def run() -> None:
                 result = subprocess.run(argv, env=env, capture_output=True, text=True)
                 if result.returncode:

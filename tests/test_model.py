@@ -161,7 +161,7 @@ def test_maximum_isolation_is_enforced_by_manifest(tmp_path, monkeypatch):
 def test_restricted_egress_is_explicit_and_round_trips():
     raw = sample(network={"mode": "restricted", "bridge": "incusbr0", "egress": [
         {"kind": "domain", "value": "API.GitHub.COM.", "port": 443, "protocol": "tcp"},
-        {"kind": "cidr", "value": "198.51.100.9/24", "port": 8443, "protocol": "tcp"}]},
+        {"kind": "cidr", "value": "198.51.100.0/24", "port": 8443, "protocol": "tcp"}]},
         security={"profile": "restricted-development"})
     manifest = Manifest.parse(raw)
     assert [(rule.kind, rule.value, rule.port) for rule in manifest.egress] == [
@@ -169,6 +169,10 @@ def test_restricted_egress_is_explicit_and_round_trips():
     assert Manifest.from_yaml(manifest.to_yaml()) == manifest
     raw["network"]["egress"] = []
     with pytest.raises(ValidationError, match="ao menos"):
+        Manifest.parse(raw)
+    raw["network"]["egress"] = [
+        {"kind": "cidr", "value": "198.51.100.9/24", "port": 8443, "protocol": "tcp"}]
+    with pytest.raises(ValidationError, match="IP ou CIDR inválido"):
         Manifest.parse(raw)
 
 
@@ -222,6 +226,17 @@ def test_import_rejects_ambiguous_yaml():
         Manifest.from_yaml(text + "name: shadow-vm\n")
     with pytest.raises(ValidationError, match="Aliases"):
         Manifest.from_yaml(text.replace("name: dev-vm", "name: &name dev-vm").replace("pool: default", "pool: *name"))
+
+
+def test_manifest_import_is_bounded_and_copy_kind_type_errors_are_validation_errors(tmp_path):
+    oversized = tmp_path / "oversized.yaml"
+    oversized.write_text("x" * 64_001, encoding="utf-8")
+    with pytest.raises(ValidationError, match="grande"):
+        import_manifest(oversized)
+    raw = sample(copies=[{"host": str(tmp_path / "source"),
+                          "guest": "/home/ubuntu/work", "kind": []}])
+    with pytest.raises(ValidationError):
+        Manifest.parse(raw, check_copy_sources=False)
 
 
 @pytest.mark.parametrize("raw", [
@@ -301,6 +316,17 @@ def test_saved_network_bridge_reads_manifest(tmp_path, monkeypatch):
     save_instance_manifest(manifest)
     assert saved_network_bridge("dev-vm") == "incusbr0"
     assert saved_network_bridge("unknown-vm") is None
+
+    path = tmp_path / "data" / "isolatevm" / "instances" / "dev-vm.yaml"
+    saved = path.read_text(encoding="utf-8")
+    path.unlink()
+    target = tmp_path / "outside.yaml"
+    target.write_text(saved, encoding="utf-8")
+    path.symlink_to(target)
+    assert saved_network_bridge("dev-vm") is None
+    path.unlink()
+    path.write_text("x" * 64_001, encoding="utf-8")
+    assert saved_network_bridge("dev-vm") is None
 
 
 def test_export_never_overwrites_and_versioned_exports_round_trip(tmp_path):

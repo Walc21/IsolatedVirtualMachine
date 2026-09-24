@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import selectors
 import shutil
 import subprocess
 import tempfile
@@ -205,19 +206,93 @@ class LocalIncus:
         if getattr(self, "access_mode", "admin") == "confined" and not self._confined_approved:
             raise IncusError("Confirme a conexão ao socket de usuário antes de consultar ou alterar o Incus.")
 
+    def _client_environment(self) -> dict[str, str]:
+        return {
+            "HOME": str(Path.home()),
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C",
+            "INCUS_CONF": str(self.client_config_dir),
+        }
+
+    def _run_capped(self, argv: list[str], *, timeout: int, output_limit_bytes: int) -> tuple[int, str, str]:
+        """Capture a bounded amount from an Incus command that relays guest data."""
+        if type(output_limit_bytes) is not int or output_limit_bytes < 1:
+            raise ValueError("output_limit_bytes precisa ser positivo")
+        try:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=False,
+                                       env=self._client_environment(), bufsize=0)
+        except OSError as exc:
+            raise IncusError("Não foi possível iniciar o cliente Incus", str(exc)) from exc
+        stdout = bytearray()
+        stderr = bytearray()
+        streams = ((process.stdout, stdout), (process.stderr, stderr))
+        deadline = time.monotonic() + timeout
+        selector = selectors.DefaultSelector()
+
+        def stop_process() -> None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+        try:
+            for stream, target in streams:
+                if stream is not None:
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, target)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    stop_process()
+                    raise IncusError("Operação Incus excedeu o tempo permitido")
+                events = selector.select(remaining)
+                if not events:
+                    stop_process()
+                    raise IncusError("Operação Incus excedeu o tempo permitido")
+                for key, _ in events:
+                    remaining_output = output_limit_bytes + 1 - len(stdout) - len(stderr)
+                    chunk = os.read(key.fileobj.fileno(), min(65536, remaining_output))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    target = key.data
+                    target.extend(chunk)
+                    if len(stdout) + len(stderr) > output_limit_bytes:
+                        stop_process()
+                        raise IncusError("Saída do guest excedeu o limite permitido; resposta suprimida")
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            stop_process()
+            raise IncusError("Operação Incus excedeu o tempo permitido") from exc
+        finally:
+            selector.close()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        return (returncode, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
+
     def _run(self, *args: str, timeout: int = 120, ok_returncodes: tuple[int, ...] = (0,),
-             stdin: str | None = None) -> str:
+             stdin: str | None = None, output_limit_bytes: int | None = None) -> str:
         # Only fixed operations call this private method. User data remains a single argv item.
         self._require_connection_approval()
+        argv = [self.binary, "--force-local", *args]
+        if output_limit_bytes is not None:
+            if stdin is not None:
+                raise ValueError("saída limitada não pode ser combinada com stdin textual")
+            returncode, stdout, stderr = self._run_capped(
+                argv, timeout=timeout, output_limit_bytes=output_limit_bytes)
+            if returncode not in ok_returncodes or (returncode and not stdout.strip()):
+                detail = (stderr or stdout).strip()[:600]
+                raise IncusError(_friendly_error(detail), detail or f"Incus retornou erro {returncode}")
+            return stdout
         try:
-            env = {**os.environ, "LC_ALL": "C", "INCUS_CONF": str(self.client_config_dir)}
-            env.pop("INCUS_REMOTE", None)
-            env.pop("INCUS_SOCKET", None)
-            env.pop("INCUS_DIR", None)
-            env.pop("INCUS_PROJECT", None)
-            result = subprocess.run([self.binary, "--force-local", *args],
+            result = subprocess.run(argv,
                                     check=False, text=True, capture_output=True,
-                                    timeout=timeout, env=env, input=stdin)
+                                    timeout=timeout, env=self._client_environment(), input=stdin)
         except subprocess.TimeoutExpired as exc:
             raise IncusError("Operação Incus excedeu o tempo permitido") from exc
         if result.returncode not in ok_returncodes or (result.returncode and not result.stdout.strip()):
@@ -228,7 +303,7 @@ class LocalIncus:
     def provisioning_status(self, name: str) -> ProvisioningStatus:
         _name(name, "VM")
         output = self._run("exec", name, "--", "cloud-init", "status", "--format=json",
-                           timeout=30, ok_returncodes=(0, 1, 2))
+                           timeout=30, ok_returncodes=(0, 1, 2), output_limit_bytes=1_000_000)
         try:
             payload = json.loads(output)
         except ValueError as exc:
@@ -260,7 +335,7 @@ class LocalIncus:
             try:
                 output = self._run("exec", name, "--", "dpkg-query", "-W",
                                    "--showformat=${binary:Package}\\t${Version}\\t${db:Status-Status}\\n",
-                                   timeout=45)
+                                   timeout=45, output_limit_bytes=2_000_000)
                 if len(output.encode("utf-8", "replace")) > 2_000_000:
                     raise IncusError("Inventário APT do guest excede o limite de leitura")
                 result.extend(entries_for("apt", apt_requested, parse_dpkg(output)))
@@ -279,7 +354,8 @@ class LocalIncus:
             if not requested:
                 continue
             try:
-                output = self._run("exec", name, "--", *command, timeout=45)
+                output = self._run("exec", name, "--", *command, timeout=45,
+                                   output_limit_bytes=2_000_000)
                 if len(output.encode("utf-8", "replace")) > 2_000_000:
                     raise IncusError(f"Inventário {manager} do guest excede o limite de leitura")
                 result.extend(entries_for(manager, requested, parser(output)))
@@ -292,7 +368,8 @@ class LocalIncus:
             try:
                 output = self._run("exec", name, "--", "go", "version", "-m",
                                    *(f"/usr/local/bin/{binary}" for binary in binaries),
-                                   timeout=45, ok_returncodes=(0, 1))
+                                   timeout=45, ok_returncodes=(0, 1),
+                                   output_limit_bytes=2_000_000)
                 if len(output.encode("utf-8", "replace")) > 2_000_000:
                     raise IncusError("Inventário Go do guest excede o limite de leitura")
                 versions = parse_go_modules(output, modules)
@@ -492,6 +569,9 @@ class LocalIncus:
             raise IncusError(f"Pool de armazenamento inexistente: {manifest.pool}")
         if manifest.networkMode in BRIDGED_NETWORK_MODES and manifest.bridge not in self.bridges():
             raise IncusError(f"Bridge Incus inexistente: {manifest.bridge}")
+        if (manifest.networkMode in PROXIED_NETWORK_MODES and
+                manifest.bridge != f"incusbr-{os.getuid()}"):
+            raise ValidationError("Proxy restrito exige a bridge Incus de usuário incusbr-<UID>")
         if any(vm.name == manifest.name for vm in self.list_vms()):
             raise IncusError("Já existe uma VM com esse nome")
         # Revalidate paths immediately before the side effect.
@@ -676,9 +756,7 @@ class LocalIncus:
         return manifest
 
     def _send_guest_secret_payload(self, name: str, payload: bytes) -> None:
-        env = {**os.environ, "LC_ALL": "C", "INCUS_CONF": str(self.client_config_dir)}
-        for key in ("INCUS_REMOTE", "INCUS_SOCKET", "INCUS_DIR", "INCUS_PROJECT"):
-            env.pop(key, None)
+        env = self._client_environment()
         argv = [self.binary, "--force-local", "--quiet", "exec", name,
                 "--force-noninteractive", "--user", "0", "--",
                 "/usr/bin/python3", "/usr/local/lib/isolatevm/inject-secrets"]
@@ -712,9 +790,7 @@ class LocalIncus:
 
     def _send_guest_copy(self, name: str, operation: tuple[str, ...],
                          source: Any = None, timeout: int = 120) -> None:
-        env = {**os.environ, "LC_ALL": "C", "INCUS_CONF": str(self.client_config_dir)}
-        for key in ("INCUS_REMOTE", "INCUS_SOCKET", "INCUS_DIR", "INCUS_PROJECT"):
-            env.pop(key, None)
+        env = self._client_environment()
         argv = [self.binary, "--force-local", "--quiet", "exec", name,
                 "--force-noninteractive", "--user", "0", "--", "/usr/bin/python3",
                 "/usr/local/lib/isolatevm/copy-files", *operation]

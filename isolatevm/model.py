@@ -185,7 +185,7 @@ class EgressRule:
                 raise ValidationError("Regra de saída: domínio inválido")
         else:
             try:
-                parsed = ipaddress.ip_network(value, strict=False) if kind == "cidr" else ipaddress.ip_address(value)
+                parsed = ipaddress.ip_network(value, strict=True) if kind == "cidr" else ipaddress.ip_address(value)
             except ValueError as exc:
                 raise ValidationError("Regra de saída: IP ou CIDR inválido") from exc
             if parsed.version != 4:
@@ -260,7 +260,7 @@ class Manifest:
             for rule in egress:
                 if rule.kind != "cidr":
                     raise ValidationError("LAN somente aceita CIDRs IPv4 privados e portas TCP explícitas")
-                network = ipaddress.ip_network(rule.value)
+                network = ipaddress.ip_network(rule.value, strict=True)
                 if not any(network.subnet_of(private) for private in LAN_IPV4_NETWORKS):
                     raise ValidationError("LAN somente aceita apenas CIDRs dentro de 10/8, 172.16/12 ou 192.168/16")
         mounts_raw = item.get("mounts", [])
@@ -442,12 +442,18 @@ class Manifest:
 
     @classmethod
     def from_yaml(cls, text: str, *, check_copy_sources: bool = True) -> "Manifest":
-        if len(text) > 64_000:
+        if not isinstance(text, str):
+            raise ValidationError("Manifesto precisa ser texto YAML")
+        try:
+            input_bytes = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValidationError("Manifesto não é texto UTF-8 válido") from None
+        if input_bytes > 64_000:
             raise ValidationError("Manifesto muito grande")
         try:
             return cls.parse(yaml.load(text, Loader=_ManifestLoader),
                              check_copy_sources=check_copy_sources)
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, TypeError, RecursionError) as exc:
             raise ValidationError("YAML inválido") from exc
 
     def review(self) -> list[str]:

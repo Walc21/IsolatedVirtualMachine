@@ -49,9 +49,12 @@ def assess(manifest: Manifest) -> tuple[Finding, ...]:
     if manifest.desktop:
         findings.append(Finding("DESKTOP_LOGIN", "warning",
                                 "A imagem cloud não configura uma senha de login gráfico; defina uma senha dentro da VM após o primeiro boot, sem guardá-la no manifesto."))
-    if "@openai/codex@latest" in manifest.npm:
-        findings.append(Finding("UNPINNED_CODEX", "warning",
-                                "Codex CLI usa @latest; fixe uma versão npm no manifesto para reprodução exata."))
+    rolling_npm = tuple(package for package in manifest.npm
+                        if package.rsplit("@", 1)[-1] == "latest")
+    if rolling_npm:
+        findings.append(Finding("ROLLING_NPM", "warning",
+                                "Pacotes npm usam @latest e podem instalar versões diferentes em provisionamentos futuros: " +
+                                ", ".join(rolling_npm) + "."))
     if set(manifest.apt) & {"docker.io", "podman"}:
         findings.append(Finding("GUEST_CONTAINER_ENGINE", "warning",
                                 "Docker/Podman serão instalados dentro da VM. O aplicativo não repassa sockets do host; execução de contêineres depende dos recursos disponíveis no guest."))

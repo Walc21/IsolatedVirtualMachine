@@ -91,23 +91,23 @@ def test_secret_references_install_only_helpers_never_values_in_cloud_init():
 
 
 def test_codex_cli_is_guest_package_without_secret():
-    m = manifest({"apt": [], "pip": [], "npm": ["@openai/codex@latest"]})
+    m = manifest({"apt": [], "pip": [], "npm": ["@openai/codex@0.154.0"]})
     config = cloud_config(m)
-    assert "@openai/codex@latest" in config
+    assert "@openai/codex@0.154.0" in config
     assert "OPENAI_API_KEY" not in config
 
 
 def test_ai_coding_packages_use_guest_user_and_keep_authentication_out_of_cloud_init():
     m = manifest({"apt": [], "pip": [],
                   "pipx": ["aider-chat==0.86.2"],
-                  "npm": ["@openai/codex@latest", "@anthropic-ai/claude-code@latest",
-                          "opencode-ai@latest"]})
+                  "npm": ["@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276",
+                          "opencode-ai@1.18.31"]})
     data = yaml.safe_load(cloud_config(m)[len("#cloud-config\n"):])
     npm_install = next(command for command in data["runcmd"] if "/usr/bin/npm" in command)
     assert npm_install[:4] == ["/usr/sbin/runuser", "--user", "ubuntu", "--"]
     assert "npm_config_prefix=/home/ubuntu/.local" in npm_install
-    assert npm_install[-3:] == ["@openai/codex@latest", "@anthropic-ai/claude-code@latest",
-                                "opencode-ai@latest"]
+    assert npm_install[-3:] == ["@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276",
+                                "opencode-ai@1.18.31"]
     assert ["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install",
             "aider-chat==0.86.2"] in data["runcmd"]
     profile = next(item for item in data["write_files"]

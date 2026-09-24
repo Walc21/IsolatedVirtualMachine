@@ -1,11 +1,16 @@
 import pytest
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
-from isolatevm.incus import IncusError, LocalIncus, _friendly_error, _redact_config
+import yaml
+
+from isolatevm.incus import IncusError, LocalIncus, VM, _friendly_error, _redact_config
 from isolatevm.mock import MockIncus
 from isolatevm.model import Manifest, Mount, ValidationError
 from isolatevm.usb import UsbDevice
 from isolatevm.gpu import GpuDevice
+from isolatevm.workspace_volume import WORKSPACE_DEVICE, volume_name as workspace_volume_name
 
 
 def sample():
@@ -30,6 +35,128 @@ def test_mock_lifecycle():
     assert len(service.list_vms()) == 2
     service.delete("dev-vm")
     assert [x.name for x in service.list_vms()] == ["dev-copy"]
+    assert service.list_vms()[0].lifecycle_disposition == "persistent"
+
+
+def test_mock_persistent_workspace_clone_has_independent_volume_and_delete_removes_it():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "persist-workspace", "workspaceSizeGiB": 12}
+    service = MockIncus(); service.create(Manifest.parse(raw))
+    source_volume = workspace_volume_name("dev-vm")
+    service.workspace_volumes[source_volume]["files"]["hello.txt"] = "kept"
+    assert service.verify_managed_lifecycle("dev-vm", "persist-workspace", "default", 12)
+    service.clone("dev-vm", "dev-copy")
+    clone_volume = workspace_volume_name("dev-copy")
+    assert service.workspace_volumes[clone_volume]["owner"] == "dev-copy"
+    assert service.workspace_volumes[clone_volume]["files"] == {"hello.txt": "kept"}
+    assert clone_volume != source_volume
+    service.workspace_volumes[clone_volume]["files"]["hello.txt"] = "changed"
+    assert service.workspace_volumes[source_volume]["files"]["hello.txt"] == "kept"
+    service.delete("dev-copy")
+    assert clone_volume not in service.workspace_volumes
+    assert source_volume in service.workspace_volumes
+
+
+def test_mock_persistent_workspace_rejects_host_mount_overlap(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    folder = tmp_path / "shared"; folder.mkdir()
+    raw = sample().to_dict()
+    raw["security"] = {"profile": "normal-development"}
+    raw["lifecycle"] = {"disposition": "persist-workspace"}
+    service = MockIncus(); service.create(Manifest.parse(raw))
+    for guest in ("/workspace", "/workspace/nested"):
+        with pytest.raises(ValidationError, match="sobrepõe"):
+            service.add_mount("dev-vm", Mount(str(folder), guest, "ro"))
+
+
+def test_clone_resets_disposable_disposition():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "delete-on-close"}
+    service = MockIncus()
+    service.create(Manifest.parse(raw))
+    service.clone("dev-vm", "dev-copy")
+    cloned = next(vm for vm in service.list_vms() if vm.name == "dev-copy")
+    assert cloned.lifecycle_disposition == "persistent"
+
+
+def test_local_clone_resets_lifecycle_and_removes_partial_clone_on_config_failure():
+    service = LocalIncus.__new__(LocalIncus)
+    service.list_vms = lambda: []
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("config", "set"):
+            raise IncusError("config denied")
+    service._run = run
+    with pytest.raises(IncusError, match="config denied"):
+        service.clone("source-vm", "clone-vm")
+    assert calls == [
+        ("copy", "source-vm", "clone-vm"),
+        ("config", "set", "clone-vm", "user.isolatevm.lifecycle-disposition=persistent"),
+        ("delete", "clone-vm", "--force"),
+    ]
+
+
+def test_local_workspace_clone_copies_volume_and_rewires_cloned_vm():
+    service = LocalIncus.__new__(LocalIncus)
+    service.list_vms = lambda: [VM("source-vm", "Stopped", "2", "2048MiB", "20GiB", "—", "Ubuntu", 0)]
+    source_volume = workspace_volume_name("source-vm")
+    target_volume = workspace_volume_name("target-vm")
+    source_config = {"config": {"user.isolatevm.managed": "true",
+                                 "user.isolatevm.lifecycle-disposition": "persist-workspace",
+                                 "user.isolatevm.workspace-volume": source_volume},
+                     "profiles": [], "devices": {WORKSPACE_DEVICE: {
+                         "type": "disk", "pool": "default", "source": source_volume,
+                         "path": "/workspace"}}}
+    service._local_instance_config = lambda name: source_config
+    service._verify_workspace_device = lambda name, local: ("default", source_volume)
+    service._verify_workspace_volume = lambda pool, volume, owner, size=None: {
+        "config": {"user.isolatevm.size-gib": "20"}}
+    service._workspace_volume_exists = lambda pool, volume: False
+    service.snapshots = lambda name: []
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    service.clone("source-vm", "target-vm")
+    assert ("storage", "volume", "copy", f"default/{source_volume}", f"default/{target_volume}") in calls
+    assert ("copy", "source-vm", "target-vm", "--instance-only") in calls
+    assert ("storage", "volume", "set", "default", target_volume,
+            "user.isolatevm.owner=target-vm") in calls
+    assert ("config", "device", "set", "target-vm", WORKSPACE_DEVICE,
+            f"source={target_volume}") in calls
+    assert ("config", "set", "target-vm", "user.isolatevm.lifecycle-disposition=persist-workspace",
+            f"user.isolatevm.workspace-volume={target_volume}") in calls
+    assert calls[-1] == ("snapshot", "create", "target-vm", "isolatevm-initial")
+
+
+def test_local_delete_removes_verified_workspace_after_vm():
+    service = LocalIncus.__new__(LocalIncus)
+    volume = workspace_volume_name("dev-vm")
+    service._security_profile = lambda _name: "maximum-isolation"
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.managed": "true",
+                   "user.isolatevm.lifecycle-disposition": "persist-workspace",
+                   "user.isolatevm.workspace-volume": volume}, "profiles": []}
+    service._verify_workspace_device = lambda name, local: ("default", volume)
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    service.delete("dev-vm")
+    assert calls == [("delete", "dev-vm", "--force"),
+                     ("storage", "volume", "delete", "default", volume)]
+
+
+def test_local_clone_reports_orphan_when_persistent_reset_and_cleanup_fail():
+    service = LocalIncus.__new__(LocalIncus)
+    service.list_vms = lambda: []
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
+    def run(*args, **kwargs):
+        if args[:1] == ("copy",): return
+        raise IncusError("denied")
+    service._run = run
+    with pytest.raises(IncusError, match="limpeza falhou"):
+        service.clone("source-vm", "clone-vm")
 
 
 def test_force_stop_uses_explicit_incus_operation():
@@ -40,6 +167,75 @@ def test_force_stop_uses_explicit_incus_operation():
     assert calls == [(("stop", "dev-vm", "--force"), {"timeout": 120})]
     with pytest.raises(ValidationError):
         service.change_state("dev-vm", "force;stop")
+
+
+def test_secret_injection_uses_stdin_not_arguments_environment_or_captured_output(monkeypatch, tmp_path):
+    raw = sample().to_dict()
+    raw["security"] = {"profile": "normal-development"}
+    raw["secrets"] = ["OPENAI_API_KEY"]
+    manifest = Manifest.parse(raw)
+    service = LocalIncus.__new__(LocalIncus)
+    service.binary = "/usr/bin/incus"
+    service.client_config_dir = tmp_path
+    service._require_connection_approval = lambda: None
+    service._local_devices = lambda _name: {}
+    service._security_profile = lambda _name: "normal-development"
+    service.list_vms = lambda: [VM(
+        "dev-vm", "Running", "2", "4096MiB", "30GiB", "—", "Ubuntu 24.04", 0)]
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest", lambda name: manifest)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("isolatevm.incus.subprocess.run", run)
+    synthetic_value = "synthetic-secret-that-must-not-enter-argv-or-environment"
+    service.inject_secrets("dev-vm", lambda names: {names[0]: synthetic_value})
+    argv, kwargs = calls[0]
+    assert argv == ["/usr/bin/incus", "--force-local", "--quiet", "exec", "dev-vm",
+                    "--force-noninteractive", "--user", "0", "--", "/usr/bin/python3",
+                    "/usr/local/lib/isolatevm/inject-secrets"]
+    assert synthetic_value.encode() in kwargs["input"]
+    assert synthetic_value not in argv
+    assert synthetic_value not in kwargs["env"].values()
+    assert kwargs["stdout"] == subprocess.DEVNULL and kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["timeout"] == 60
+
+
+def test_secret_injection_validates_vm_before_retrieving_values(monkeypatch):
+    raw = sample().to_dict()
+    raw["security"] = {"profile": "normal-development"}
+    raw["secrets"] = ["OPENAI_API_KEY"]
+    manifest = Manifest.parse(raw)
+    service = LocalIncus.__new__(LocalIncus)
+    service._require_connection_approval = lambda: None
+    service._local_devices = lambda _name: {}
+    service._security_profile = lambda _name: "normal-development"
+    service.list_vms = lambda: []
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest", lambda name: manifest)
+    called = []
+    with pytest.raises(IncusError, match="Ligue a VM"):
+        service.inject_secrets("dev-vm", lambda names: called.append(names) or {names[0]: "synthetic"})
+    assert called == []
+
+
+def test_secret_cleanup_remains_available_after_external_profile_change(monkeypatch, tmp_path):
+    raw = sample().to_dict()
+    raw["security"] = {"profile": "normal-development"}
+    raw["secrets"] = ["OPENAI_API_KEY"]
+    manifest = Manifest.parse(raw)
+    service = LocalIncus.__new__(LocalIncus)
+    service._require_connection_approval = lambda: None
+    service._local_devices = lambda _name: {}
+    service._security_profile = lambda _name: "maximum-isolation"
+    service.list_vms = lambda: [VM(
+        "dev-vm", "Running", "2", "4096MiB", "30GiB", "—", "Ubuntu 24.04", 0)]
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest", lambda name: manifest)
+    payloads = []
+    service._send_guest_secret_payload = lambda _name, payload: payloads.append(payload)
+    service.clear_secrets("dev-vm")
+    assert payloads == [b"{}"]
 
 
 def test_provisioning_status_reads_guest_without_leaking_error_details():
@@ -73,7 +269,8 @@ def test_list_cards_separate_host_mounts_from_volumes_and_show_effective_policy(
     service._read = lambda *args: [{"name": "dev-vm", "type": "virtual-machine", "status": "Running",
         "expanded_config": {"limits.cpu": "4", "limits.memory": "8192MiB",
                             "image.os": "Ubuntu", "image.release": "24.04",
-                            "user.isolatevm.security-profile": "normal-development"},
+                            "user.isolatevm.security-profile": "normal-development",
+                            "user.isolatevm.lifecycle-disposition": "delete-on-close"},
         "expanded_devices": {"root": {"type": "disk", "path": "/", "size": "50GiB"},
                              "share": {"type": "disk", "source": "/home/user/project", "path": "/workspace"},
                              "volume": {"type": "disk", "source": "data", "path": "/data"},
@@ -86,7 +283,41 @@ def test_list_cards_separate_host_mounts_from_volumes_and_show_effective_policy(
     assert vm.os == "Ubuntu 24.04"
     assert vm.ip == "10.0.0.2"
     assert vm.security_profile == "normal-development"
+    assert vm.lifecycle_disposition == "delete-on-close"
     assert "saída não verificada" in vm.network_policy
+
+
+def test_lifecycle_verification_uses_unredacted_local_markers_and_requires_no_profiles():
+    service = LocalIncus.__new__(LocalIncus)
+    data = {"config": {"user.isolatevm.managed": "true",
+                       "user.isolatevm.lifecycle-disposition": "restore-initial-on-close"},
+            "profiles": []}
+    service._run = lambda *args, **kwargs: yaml.safe_dump(data)
+    assert service.verify_managed_lifecycle("dev-vm", "restore-initial-on-close")
+    assert not service.verify_managed_lifecycle("dev-vm", "delete-on-close")
+    data["profiles"] = ["default"]
+    assert not service.verify_managed_lifecycle("dev-vm", "restore-initial-on-close")
+
+
+def test_persistent_workspace_verification_checks_device_volume_and_size():
+    service = LocalIncus.__new__(LocalIncus)
+    volume = workspace_volume_name("dev-vm")
+    instance = {"config": {"user.isolatevm.managed": "true",
+                            "user.isolatevm.lifecycle-disposition": "persist-workspace",
+                            "user.isolatevm.workspace-volume": volume},
+                "profiles": [], "devices": {WORKSPACE_DEVICE: {
+                    "type": "disk", "pool": "default", "source": volume,
+                    "path": "/workspace"}}}
+    volume_data = {"type": "custom", "content_type": "filesystem",
+                   "config": {"user.isolatevm.managed": "true",
+                              "user.isolatevm.owner": "dev-vm",
+                              "user.isolatevm.size-gib": "20", "size": "20GiB"}}
+    service._local_instance_config = lambda _name: instance
+    service._verify_workspace_volume = lambda pool, vol, owner, size=None: volume_data
+    assert service.verify_managed_lifecycle("dev-vm", "persist-workspace", "default", 20)
+    instance["devices"][WORKSPACE_DEVICE]["source"] = "other/workspace"
+    with pytest.raises(IncusError, match="Dispositivo /workspace"):
+        service.verify_managed_lifecycle("dev-vm", "persist-workspace", "default", 20)
 
 
 def test_create_has_no_profile_or_nic_when_offline():
@@ -105,8 +336,112 @@ def test_create_has_no_profile_or_nic_when_offline():
     assert "root,size=30GiB" in args
     assert "user.isolatevm.managed=true" in args
     assert "user.isolatevm.security-profile=custom" in args
+    assert "user.isolatevm.lifecycle-disposition=persistent" in args
     assert any("cloud-init.user-data=#cloud-config" in part for part in args)
     assert events[-1] == "VM criada e parada"
+
+
+def test_create_persists_explicit_disposable_lifecycle_disposition():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "delete-on-close"}
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    service.create(Manifest.parse(raw))
+    assert "user.isolatevm.lifecycle-disposition=delete-on-close" in calls[0]
+
+
+def test_create_makes_reserved_initial_snapshot_for_restore_lifecycle():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "restore-initial-on-close"}
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    service.create(Manifest.parse(raw))
+    assert calls[-1] == ("snapshot", "create", "dev-vm", "isolatevm-initial")
+
+
+def test_create_persistent_workspace_uses_private_custom_volume_and_initial_snapshot():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "persist-workspace", "workspaceSizeGiB": 18}
+    manifest = Manifest.parse(raw)
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    service._workspace_volume_exists = lambda pool, volume: False
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append((args, kwargs))
+    service.create(manifest)
+    volume = workspace_volume_name("dev-vm")
+    assert calls[0][0][:5] == ("storage", "volume", "create", "default", volume)
+    assert "size=18GiB" in calls[0][0]
+    create_args, create_kwargs = next((args, kwargs) for args, kwargs in calls if args[0] == "create")
+    payload = yaml.safe_load(create_kwargs["stdin"])
+    assert payload["config"]["user.isolatevm.workspace-volume"] == volume
+    assert payload["devices"][WORKSPACE_DEVICE] == {
+        "type": "disk", "pool": "default", "source": volume,
+        "path": "/workspace"}
+    assert payload["devices"]["root"]["size"] == "30GiB"
+    assert "-d" not in create_args
+    assert calls[-1][0] == ("snapshot", "create", "dev-vm", "isolatevm-initial")
+
+
+def test_create_workspace_refuses_preexisting_deterministic_volume():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "persist-workspace"}
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    service._workspace_volume_exists = lambda pool, volume: True
+    service._run = lambda *args, **kwargs: pytest.fail("must not mutate existing volume or create VM")
+    with pytest.raises(IncusError, match="volume persistente reservado já existe"):
+        service.create(Manifest.parse(raw))
+
+
+def test_failed_workspace_initial_snapshot_cleans_vm_and_owned_volume():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "persist-workspace", "workspaceSizeGiB": 10}
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    service._workspace_volume_exists = lambda pool, volume: False
+    service._verify_workspace_volume = lambda pool, volume, owner, size=None: {}
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("snapshot", "create"):
+            raise IncusError("snapshot failed")
+    service._run = run
+    with pytest.raises(IncusError, match="snapshot failed"):
+        service.create(Manifest.parse(raw))
+    volume = workspace_volume_name("dev-vm")
+    assert calls[-2:] == [("delete", "dev-vm", "--force"),
+                          ("storage", "volume", "delete", "default", volume)]
+
+
+def test_failed_initial_snapshot_creation_removes_incomplete_vm():
+    raw = sample().to_dict()
+    raw["lifecycle"] = {"disposition": "restore-initial-on-close"}
+    service = LocalIncus.__new__(LocalIncus)
+    service.preflight = lambda _manifest: None
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("snapshot", "create"):
+            raise IncusError("snapshot failed")
+    service._run = run
+    with pytest.raises(IncusError, match="snapshot failed"):
+        service.create(Manifest.parse(raw))
+    assert calls[-1] == ("delete", "dev-vm", "--force")
+
+
+def test_initial_lifecycle_snapshot_cannot_be_renamed_or_deleted():
+    service = LocalIncus.__new__(LocalIncus)
+    with pytest.raises(ValidationError, match="reservado"):
+        service.snapshot("dev-vm", "isolatevm-initial")
+    with pytest.raises(ValidationError, match="snapshot inicial"):
+        service.rename_snapshot("dev-vm", "isolatevm-initial", "renamed")
+    with pytest.raises(ValidationError, match="snapshot inicial"):
+        service.delete_snapshot("dev-vm", "isolatevm-initial")
 
 
 def test_create_network_uses_separate_device_properties():
@@ -290,11 +625,12 @@ def test_maximum_isolation_blocks_later_mounts_and_nic(tmp_path, monkeypatch):
 
 
 def test_mock_usb_is_explicit_managed_and_rejected_by_maximum_isolation():
-    usb = UsbDevice("1-7", "2b7e", "0134", "Camera")
+    usb = UsbDevice("1-7", "2b7e", "0134", "Camera", 1, 7, "camera-serial")
     service = MockIncus(); service.create(sample())
     service.add_usb_device("dev-vm", usb)
     effective = service.effective("dev-vm")
-    assert effective["other_devices"] == [{"device": "isousb0", "type": "usb", "managed": True}]
+    assert effective["other_devices"] == [{"device": "isousb0", "type": "usb", "managed": True,
+                                             "identity": "2b7e:0134 · serial camera-serial"}]
     service.remove_usb_device("dev-vm", "isousb0")
     assert not service.effective("dev-vm")["other_devices"]
     raw = sample().to_dict(); raw["security"] = {"profile": "maximum-isolation"}
@@ -303,17 +639,48 @@ def test_mock_usb_is_explicit_managed_and_rejected_by_maximum_isolation():
         service.add_usb_device("dev-vm", usb)
 
 
-def test_local_usb_uses_only_ids_and_managed_slot(monkeypatch):
+def test_local_usb_prefers_unique_serial_and_managed_slot(monkeypatch):
     service = LocalIncus.__new__(LocalIncus)
     service._security_profile = lambda name: "custom"
     service._check_usb_policy = lambda: None
     service._local_devices = lambda name: {"root": {"type": "disk"}}
     calls = []
     service._run = lambda *args, **kwargs: calls.append(args)
-    service.add_usb_device("dev-vm", UsbDevice("1-7", "2b7e", "0134", "Camera"))
-    assert calls == [("config", "device", "add", "dev-vm", "isousb0", "usb", "vendorid=2b7e", "productid=0134", "required=false")]
+    camera = UsbDevice("1-7", "2b7e", "0134", "Camera", 1, 7, "camera-serial")
+    monkeypatch.setattr("isolatevm.incus.host_usb_devices", lambda: [camera])
+    service.add_usb_device("dev-vm", camera)
+    assert calls == [("config", "device", "add", "dev-vm", "isousb0", "usb", "vendorid=2b7e",
+                      "productid=0134", "serial=camera-serial", "required=false")]
     with pytest.raises(ValidationError):
         service.remove_usb_device("dev-vm", "usb0")
+
+
+def test_local_usb_uses_current_address_for_duplicate_serial(monkeypatch):
+    service = LocalIncus.__new__(LocalIncus)
+    service._security_profile = lambda name: "custom"
+    service._check_usb_policy = lambda: None
+    service._local_devices = lambda name: {}
+    calls = []; service._run = lambda *args, **kwargs: calls.append(args)
+    selected = UsbDevice("1-7", "2b7e", "0134", "Camera", 1, 7, "same-serial")
+    duplicate = UsbDevice("2-4", "2b7e", "0134", "Camera", 2, 9, "same-serial")
+    monkeypatch.setattr("isolatevm.incus.host_usb_devices", lambda: [selected, duplicate])
+    service.add_usb_device("dev-vm", selected)
+    assert calls == [("config", "device", "add", "dev-vm", "isousb0", "usb", "vendorid=2b7e",
+                      "productid=0134", "busnum=1", "devnum=7", "required=false")]
+
+
+def test_local_usb_refuses_stale_selection(monkeypatch):
+    service = LocalIncus.__new__(LocalIncus)
+    service._security_profile = lambda name: "custom"
+    service._check_usb_policy = lambda: None
+    service._local_devices = lambda name: {}
+    calls = []; service._run = lambda *args, **kwargs: calls.append(args)
+    selected = UsbDevice("1-7", "2b7e", "0134", "Camera", 1, 7, "camera-serial")
+    replacement = UsbDevice("1-7", "2b7e", "0134", "Camera", 1, 8, "camera-serial")
+    monkeypatch.setattr("isolatevm.incus.host_usb_devices", lambda: [replacement])
+    with pytest.raises(ValidationError, match="mudou desde a seleção"):
+        service.add_usb_device("dev-vm", selected)
+    assert calls == []
 
 
 def test_local_gpu_uses_only_pci_and_managed_slot():
@@ -424,3 +791,26 @@ def test_failed_full_backup_leaves_no_destination(tmp_path):
     with pytest.raises(IncusError, match="export failed"):
         service.export_full("dev-vm", tmp_path / "failed.tar.gz")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_workspace_export_is_create_only_and_private(tmp_path):
+    service = LocalIncus.__new__(LocalIncus)
+    volume = workspace_volume_name("dev-vm")
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.managed": "true",
+                   "user.isolatevm.lifecycle-disposition": "persist-workspace"}, "profiles": []}
+    service._verify_workspace_device = lambda name, local: ("default", volume)
+    calls = []
+    def export(*args, **kwargs):
+        calls.append(args)
+        Path(args[5]).write_bytes(b"workspace backup")
+        Path(args[5]).chmod(0o666)
+    service._run = export
+    target = tmp_path / "dev-vm-workspace.tar.gz"
+    service.export_workspace("dev-vm", target)
+    assert target.read_bytes() == b"workspace backup"
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert calls[0][:5] == ("storage", "volume", "export", "default", volume)
+    assert list(tmp_path.iterdir()) == [target]
+    with pytest.raises(ValidationError, match="já existe"):
+        service.export_workspace("dev-vm", target)

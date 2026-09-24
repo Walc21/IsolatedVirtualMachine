@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+"""Run a guest command with selected secrets from volatile /run files."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+
+
+SECRET_DIR = Path("/run/isolatevm-secrets")
+SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+RESERVED = {"PATH", "HOME", "SHELL", "USER", "LOGNAME", "PWD", "IFS", "ENV",
+            "BASH_ENV", "PYTHONPATH", "PYTHONHOME"}
+MAX_SECRET_BYTES = 16 * 1024
+
+
+def run_is_tmpfs() -> bool:
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        if not separator:
+            continue
+        fields = before.split()
+        filesystem = after.split()
+        if len(fields) > 4 and filesystem and fields[4] == "/run":
+            return filesystem[0] == "tmpfs"
+    return False
+
+
+def _load_secret(directory: Path, name: str, group_id: int, owner_uid: int = 0) -> str:
+    if not SECRET_NAME.fullmatch(name) or name in RESERVED or name.startswith("LD_"):
+        raise ValueError("invalid secret name")
+    directory_info = directory.lstat()
+    if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != owner_uid or
+            directory_info.st_gid != group_id or stat.S_IMODE(directory_info.st_mode) != 0o750):
+        raise ValueError("unsafe secret directory")
+    path = directory / name
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != owner_uid or
+                info.st_gid != group_id or stat.S_IMODE(info.st_mode) != 0o640 or
+                info.st_size > MAX_SECRET_BYTES):
+            raise ValueError("unsafe secret file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            value = stream.read(MAX_SECRET_BYTES + 1)
+    finally:
+        os.close(fd)
+    if not value or len(value) > MAX_SECRET_BYTES or b"\x00" in value:
+        raise ValueError("invalid secret value")
+    return value.decode("utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    names: list[str] = []
+    while len(args) >= 2 and args[0] == "--secret":
+        names.append(args[1])
+        args = args[2:]
+    if not names or not args or args[0] != "--" or len(args) < 2:
+        sys.stderr.write("Uso: isolatevm-run --secret NOME [--secret NOME] -- COMANDO [ARGS...]\n")
+        return 2
+    try:
+        user = pwd.getpwnam("ubuntu")
+        if user.pw_uid != 1000 or os.getuid() != user.pw_uid or not run_is_tmpfs():
+            raise ValueError("guest runtime unavailable")
+        env = os.environ.copy()
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate secret")
+        for name in names:
+            env[name] = _load_secret(SECRET_DIR, name, user.pw_gid)
+        os.execvpe(args[1], args[1:], env)
+    except Exception:
+        sys.stderr.write("Secret unavailable; confirm the guest user, VM runtime, and injected references.\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

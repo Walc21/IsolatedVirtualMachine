@@ -9,6 +9,222 @@ import pytest
 @pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
                     not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
                     reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
+def test_existing_vm_change_preview_can_be_cancelled(tmp_path):
+    script = '''
+import os
+import traceback
+from gi.repository import GLib, Gtk
+from isolatevm import change_diff as diff
+from isolatevm.model import Manifest
+from isolatevm.storage import history, load_instance_manifest, save_instance_manifest
+from isolatevm.workspace_volume import volume_name as workspace_volume_name
+from isolatevm.ui import IsolateApp
+
+app = IsolateApp()
+def begin():
+    try:
+        window = app.get_active_window()
+        manifest = Manifest.parse({"schemaVersion": 1, "name": "preview-vm",
+            "os": {"distribution": "ubuntu", "release": "24.04"},
+            "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+            "network": {"mode": "offline"}, "mounts": [], "software": {"apt": []},
+            "security": {"profile": "maximum-isolation"}})
+        window.service.create(manifest)
+        window._review_change("preview-vm", "resources",
+                              lambda current: diff.resources(current, 4, 4096),
+                              lambda: window.service.set_resources("preview-vm", 4, 4096))
+        GLib.timeout_add(450, inspect)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def inspect():
+    try:
+        window = app.get_active_window()
+        dialogs = [item for item in Gtk.Window.list_toplevels()
+                   if isinstance(item, Gtk.Dialog) and item.get_title().startswith("Revisar alteração")]
+        assert len(dialogs) == 1
+        dialog = dialogs[0]
+        assert dialog.get_widget_for_response(Gtk.ResponseType.OK).get_label() == "Aplicar alterações"
+        labels = []
+        def collect(widget):
+            if isinstance(widget, Gtk.TextView):
+                buffer = widget.get_buffer()
+                labels.append(buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False))
+            child = widget.get_first_child()
+            while child is not None:
+                collect(child); child = child.get_next_sibling()
+        collect(dialog)
+        assert "- CPU: 2; RAM: 2048MiB" in " ".join(labels)
+        assert "+ CPU: 4; RAM: 4096MiB" in " ".join(labels)
+        dialog.response(Gtk.ResponseType.CANCEL)
+        assert window.service.list_vms()[0].cpu == "2"
+        window._review_change("preview-vm", "resources",
+                              lambda current: diff.resources(current, 4, 4096),
+                              lambda: window.service.set_resources("preview-vm", 4, 4096))
+        GLib.timeout_add(450, inspect_stale)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def inspect_stale():
+    try:
+        window = app.get_active_window()
+        dialogs = [item for item in Gtk.Window.list_toplevels()
+                   if isinstance(item, Gtk.Dialog) and item.get_title().startswith("Revisar alteração")]
+        assert len(dialogs) == 1
+        window.service.set_resources("preview-vm", 3, 2048)
+        dialogs[0].response(Gtk.ResponseType.OK)
+        GLib.timeout_add(450, finish)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def finish():
+    try:
+        window = app.get_active_window()
+        assert window.service.list_vms()[0].cpu == "3"
+        for dialog in Gtk.Window.list_toplevels():
+            if isinstance(dialog, Gtk.MessageDialog): dialog.destroy()
+        window.close(); app.quit()
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+GLib.timeout_add(300, begin)
+app.run([])
+'''
+    env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+
+
+@pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
+                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
+def test_disposable_close_requires_confirmation_and_deletes_only_after_apply(tmp_path):
+    script = '''
+import os
+import traceback
+from gi.repository import GLib, Gtk
+from isolatevm.incus import LocalIncus
+from isolatevm.model import Manifest
+from isolatevm.storage import history, load_instance_manifest, save_instance_manifest
+from isolatevm.workspace_volume import volume_name as workspace_volume_name
+from isolatevm.ui import IsolateApp
+
+app = IsolateApp()
+def begin():
+    try:
+        window = app.get_active_window()
+        manifest = Manifest.parse({"schemaVersion": 1, "name": "disposable-vm",
+            "os": {"distribution": "ubuntu", "release": "24.04"},
+            "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+            "network": {"mode": "offline"}, "mounts": [], "software": {"apt": []},
+            "security": {"profile": "maximum-isolation"},
+            "lifecycle": {"disposition": "delete-on-close"}})
+        restore_manifest = Manifest.parse({"schemaVersion": 1, "name": "restore-vm",
+            "os": {"distribution": "ubuntu", "release": "24.04"},
+            "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+            "network": {"mode": "offline"}, "mounts": [], "software": {"apt": []},
+            "security": {"profile": "maximum-isolation"},
+            "lifecycle": {"disposition": "restore-initial-on-close"}})
+        workspace_manifest = Manifest.parse({"schemaVersion": 1, "name": "workspace-vm",
+            "os": {"distribution": "ubuntu", "release": "24.04"},
+            "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+            "network": {"mode": "offline"}, "mounts": [], "software": {"apt": []},
+            "security": {"profile": "maximum-isolation"},
+            "lifecycle": {"disposition": "persist-workspace", "workspaceSizeGiB": 8}})
+        window.service.create(manifest)
+        window.service.create(restore_manifest)
+        window.service.create(workspace_manifest)
+        save_instance_manifest(manifest)
+        save_instance_manifest(restore_manifest)
+        save_instance_manifest(workspace_manifest)
+        mock = window.service
+        mock.workspace_volumes[workspace_volume_name("workspace-vm")]["files"]["kept.txt"] = "persistent-data"
+        service = LocalIncus.__new__(LocalIncus)
+        service.access_mode = "admin"
+        service._confined_approved = True
+        service.list_vms = mock.list_vms
+        service.effective = mock.effective
+        service.verify_managed_lifecycle = mock.verify_managed_lifecycle
+        service.delete = mock.delete
+        service.snapshots = mock.snapshots
+        service.restore_snapshot = mock.restore_snapshot
+        service.change_state = mock.change_state
+        window.service = service
+        window.mock = False
+        assert window._close_requested() is True
+        GLib.timeout_add(350, cancel_first)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def close_dialog():
+    dialogs = [item for item in Gtk.Window.list_toplevels()
+               if isinstance(item, Gtk.MessageDialog) and
+               "ação de ciclo de vida" in item.get_property("text")]
+    assert len(dialogs) == 1
+    return dialogs[0]
+
+def cancel_first():
+    try:
+        window = app.get_active_window()
+        dialog = close_dialog()
+        assert dialog.get_widget_for_response(Gtk.ResponseType.APPLY).get_label() == "Aplicar e fechar"
+        dialog.response(Gtk.ResponseType.CANCEL)
+        assert len(window.service.list_vms()) == 3
+        assert window._close_requested() is True
+        GLib.timeout_add(350, confirm_delete)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def confirm_delete():
+    try:
+        dialog = close_dialog()
+        dialog.response(Gtk.ResponseType.APPLY)
+        GLib.timeout_add(350, finish)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def finish():
+    try:
+        window = app.get_active_window()
+        remaining = window.service.list_vms()
+        assert [vm.name for vm in remaining] == ["restore-vm", "workspace-vm"]
+        assert "isolatevm-initial" in window.service.snapshots("restore-vm")
+        assert "isolatevm-initial" in window.service.snapshots("workspace-vm")
+        assert window.service.verify_managed_lifecycle("workspace-vm", "persist-workspace", "default", 8)
+        assert workspace_volume_name("workspace-vm") in mock.workspace_volumes
+        assert mock.workspace_volumes[workspace_volume_name("workspace-vm")]["files"]["kept.txt"] == "persistent-data"
+        try:
+            load_instance_manifest("disposable-vm")
+            raise AssertionError("local disposable manifest was not removed")
+        except ValueError:
+            pass
+        assert load_instance_manifest("restore-vm").lifecycleDisposition == "restore-initial-on-close"
+        assert load_instance_manifest("workspace-vm").lifecycleDisposition == "persist-workspace"
+        assert any(event["source"] == "auto-close" and event["vm"] == "disposable-vm"
+                   for event in history())
+        assert any(event["action"] == "snapshot-restore" and event["vm"] == "restore-vm"
+                   for event in history())
+        window.close(); app.quit()
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+GLib.timeout_add(300, begin)
+app.run([])
+'''
+    env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+
+
+@pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
+                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
 def test_wizard_dashboard_and_permissions(tmp_path):
     script = '''
 import os
@@ -142,9 +358,13 @@ def flow():
                "resources": {"cpu": 2, "memoryMiB": 4096, "diskGiB": 30, "pool": "default"},
                "network": {"mode": "offline"},
                "security": {"profile": "normal-development"},
+               "lifecycle": {"disposition": "restore-initial-on-close"},
                "mounts": [{"host": str(first), "guest": "/workspace", "mode": "rw"},
                           {"host": str(second), "guest": "/datasets", "mode": "ro"}],
-               "software": {"apt": ["git", "postgresql-client", "golang-go", "pipx", "docker.io", "python3", "python3-pip"],
+               "software": {"apt": ["git", "postgresql-client", "golang-go", "pipx", "docker.io", "python3", "python3-pip", "dotnet-sdk-10.0"],
+                            "pipx": ["uv==0.12.18", "poetry==2.5.1"],
+                            "npm": ["bun@1.4.2", "@pnpm/exe@12.5.1"],
+                            "external": ["helm@community", "terraform@hashicorp", "kubectl@1.37"],
                             "cargo": ["ripgrep@14.1.1"], "go": ["golang.org/x/tools/gopls@v0.20.0"]},
                "environment": {"NODE_ENV": "development"}}
         with patch.object(Path, "home", return_value=test_home):
@@ -155,10 +375,19 @@ def flow():
             assert window.desktop_check.get_active()
             assert window.catalog_checks["git"].get_active()
             assert window.catalog_checks["docker.io"].get_active()
+            assert window.catalog_checks["pipx:uv==0.12.18"].get_active()
+            assert window.catalog_checks["npm:bun@1.4.2"].get_active()
+            assert window.catalog_checks["npm:@pnpm/exe@12.5.1"].get_active()
+            assert window.catalog_checks["external:helm@community"].get_active()
+            assert window.catalog_checks["external:terraform@hashicorp"].get_active()
+            assert window.catalog_checks["external:kubectl@1.37"].get_active()
+            assert window.dotnet10_check.get_active()
             assert window.python_check.get_active()
             assert window.cargo_input.get_text() == "ripgrep@14.1.1"
             assert window.go_input.get_text() == "golang.org/x/tools/gopls@v0.20.0"
-            assert window._form_manifest() == manifest
+            assert window.lifecycle_input.get_active() == 3
+            rebuilt = window._form_manifest()
+            assert rebuilt == manifest, f"rebuilt={rebuilt.to_dict()!r}; original={manifest.to_dict()!r}"
             window.catalog_checks["docker.io"].set_active(False)
             assert "docker.io" not in window._form_manifest().apt
             window.catalog_checks["docker.io"].set_active(True)

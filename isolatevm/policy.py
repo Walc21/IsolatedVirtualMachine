@@ -22,6 +22,24 @@ def assess(manifest: Manifest) -> tuple[Finding, ...]:
     if manifest.networkMode == "restricted":
         findings.append(Finding("NETWORK_RESTRICTED_PROXY", "info",
                                 "Saída restrita usa proxy HTTPS local; DNS e conexões diretas da VM serão bloqueados."))
+    if manifest.secrets:
+        findings.append(Finding("GUEST_SECRETS", "high",
+                                "Secrets do cofre só são entregues após confirmação; processos do usuário ubuntu na VM poderão lê-los até ela desligar ou os arquivos temporários serem removidos."))
+    if manifest.copies:
+        findings.append(Finding("HOST_COPY", "warning",
+                                "Os arquivos escolhidos serão transferidos uma vez ao disco da VM após iniciá-la; poderão permanecer em snapshots e exports."))
+        if any(copy.include_hidden for copy in manifest.copies):
+            findings.append(Finding("HIDDEN_HOST_COPY", "high",
+                                    "A inclusão explícita de arquivos ocultos pode transferir dados privados; revise toda a pasta escolhida."))
+    if manifest.lifecycleDisposition == "delete-on-close":
+        findings.append(Finding("DISPOSABLE_DELETE", "high",
+                                "Ao fechar o IsolateVM, será solicitada confirmação para excluir esta VM e seus snapshots. A exclusão é destrutiva e não pode ser desfeita."))
+    if manifest.lifecycleDisposition == "restore-initial-on-close":
+        findings.append(Finding("DISPOSABLE_RESTORE", "high",
+                                "Ao fechar o IsolateVM, será solicitada confirmação para parar a VM e restaurar o snapshot inicial; mudanças posteriores no disco serão perdidas."))
+    if manifest.lifecycleDisposition == "persist-workspace":
+        findings.append(Finding("PERSISTENT_WORKSPACE", "warning",
+                                f"/workspace fica em um volume Incus separado de {manifest.workspaceSizeGiB} GiB. O snapshot da VM e o backup completo da VM não incluem esse volume; exporte os dados separadamente."))
     if manifest.networkMode == "offline" and (manifest.apt or manifest.pip or manifest.npm or manifest.cargo or manifest.go or manifest.desktop):
         findings.append(Finding("OFFLINE_PROVISION", "warning",
                                 "Sem rede, pacotes ausentes da imagem/cache podem não ser instalados no primeiro boot."))

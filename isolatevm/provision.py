@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import yaml
+from pathlib import Path
 
 from .model import DESKTOP_PACKAGES, Manifest
+from .workspace_volume import (WORKSPACE_GUEST_GID, WORKSPACE_GUEST_MODE,
+                               WORKSPACE_GUEST_UID)
 
 
 GO_INSTALL_RETRY = """#!/bin/sh
@@ -32,7 +35,20 @@ def apt_packages(manifest: Manifest) -> tuple[str, ...]:
         apt.extend(["cargo", "build-essential"])
     if manifest.go:
         apt.append("golang-go")
+    if manifest.pipx:
+        apt.extend(["pipx", "python3-venv"])
+    if manifest.externalTools:
+        apt.extend(["ca-certificates", "curl", "gnupg"])
     return tuple(dict.fromkeys(apt))
+
+
+def _guest_helper(filename: str) -> str:
+    candidates = (Path("/usr/lib/isolatevm/guest") / filename,
+                  Path(__file__).resolve().parents[1] / "packaging" / "guest" / filename)
+    for path in candidates:
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Guest helper ausente: {filename}")
 
 
 def cloud_config(manifest: Manifest, proxy_url: str | None = None) -> str | None:
@@ -50,10 +66,30 @@ def cloud_config(manifest: Manifest, proxy_url: str | None = None) -> str | None
                          "--version", version, crate])
     for spec in manifest.go:
         commands.append(["/usr/local/lib/isolatevm/go-install", spec])
+    if manifest.externalTools:
+        commands.append(["/usr/local/lib/isolatevm/setup-devops-packages", *manifest.externalTools])
+    for spec in manifest.pipx:
+        commands.append(["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install", spec])
+    if "rustup" in manifest.apt:
+        commands.append(["/usr/sbin/runuser", "--user", "ubuntu", "--", "rustup",
+                         "default", "stable"])
+    if manifest.lifecycleDisposition == "persist-workspace":
+        commands.extend([
+            ["/usr/bin/chown", f"{WORKSPACE_GUEST_UID}:{WORKSPACE_GUEST_GID}", "/workspace"],
+            ["/usr/bin/chmod", WORKSPACE_GUEST_MODE, "/workspace"],
+        ])
     if manifest.go:
         files.append({"path": "/usr/local/lib/isolatevm/go-install", "content": GO_INSTALL_RETRY,
                       "owner": "root:root", "permissions": "0755"})
-    if not apt and not commands and not manifest.environment and not proxy_url: return None
+    if manifest.externalTools:
+        files.append({"path": "/usr/local/lib/isolatevm/setup-devops-packages",
+                      "content": _guest_helper("isolatevm-setup-devops"),
+                      "owner": "root:root", "permissions": "0750"})
+    if manifest.pipx:
+        files.append({"path": "/etc/profile.d/isolatevm-pipx.sh",
+                      "content": 'case ":$PATH:" in *:/home/ubuntu/.local/bin:*) ;; *) PATH="$PATH:/home/ubuntu/.local/bin" ;; esac\nexport PATH\n',
+                      "owner": "root:root", "permissions": "0644"})
+    if not apt and not commands and not manifest.environment and not proxy_url and not manifest.secrets and not manifest.copies: return None
     data: dict[str, object] = {}
     if apt:
         data["package_update"] = True
@@ -63,6 +99,19 @@ def cloud_config(manifest: Manifest, proxy_url: str | None = None) -> str | None
         content = "\n" + "".join(f"{key}={value}\n" for key, value in manifest.environment)
         files.append({"path": "/etc/environment", "content": content,
                       "append": True, "owner": "root:root", "permissions": "0644"})
+    if manifest.secrets:
+        files.extend([
+            {"path": "/usr/local/lib/isolatevm/inject-secrets",
+             "content": _guest_helper("isolatevm-inject-secrets.py"),
+             "owner": "root:root", "permissions": "0750"},
+            {"path": "/usr/local/bin/isolatevm-run",
+             "content": _guest_helper("isolatevm-run"),
+             "owner": "root:root", "permissions": "0755"},
+        ])
+    if manifest.copies:
+        files.append({"path": "/usr/local/lib/isolatevm/copy-files",
+                      "content": _guest_helper("isolatevm-copy-files.py"),
+                      "owner": "root:root", "permissions": "0750"})
     if proxy_url:
         files.append({"path": "/etc/apt/apt.conf.d/90isolatevm-proxy",
                       "content": (f'Acquire::http::Proxy "{proxy_url}";\n'

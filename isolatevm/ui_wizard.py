@@ -7,12 +7,14 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk
 
-from .model import Manifest, Mount, ValidationError
+from .model import CopySpec, Manifest, Mount, ValidationError
 from .policy import assess
 from .planning import CreationPlan, plan_creation
 from .provision import cloud_config
-from .software_catalog import CATALOG_GROUPS, CATALOG_PACKAGES, LANGUAGE_PRESETS
-from .storage import audit, export_manifest, import_manifest, load_template, save_instance_manifest, save_template, templates
+from .software_catalog import (APT_CATALOG_PACKAGES, CATALOG_GROUPS, DOTNET_SDK_PACKAGES,
+                               LANGUAGE_PRESETS, NPM_CATALOG_PACKAGES,
+                               PIPX_CATALOG_PACKAGES)
+from .storage import audit, export_manifest, import_manifest, load_template, save_instance_manifest, save_template, save_template_versioned, templates
 from .ui_widgets import label, button, row, entry, combo
 
 
@@ -24,11 +26,20 @@ class MountEditor:
     rw: Gtk.CheckButton
 
 
+@dataclass
+class CopyEditor:
+    frame: Gtk.Frame
+    host: Gtk.Entry
+    guest: Gtk.Entry
+    kind: str
+    include_hidden: Gtk.CheckButton
+
+
 class WizardMixin:
     def _build_wizard(self) -> None:
         self._clear(self.wizard)
         self.wizard.append(label("Novo Ambiente", "page-title"))
-        self.wizard.append(label("Criação declarativa. A VM nasce parada; você a inicia após revisar.", "muted"))
+        self.wizard.append(label("Criação declarativa. A VM nasce parada; cópias únicas são aplicadas depois do primeiro start.", "muted"))
         self.step_title = label("", "section-title")
         self.wizard.append(self.step_title)
         self.step_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -56,17 +67,35 @@ class WizardMixin:
         self.bridge_input = entry("incusbr0")
         self.egress_input = entry("github.com:443, api.github.com:443")
         self.security_profile_input = combo(["maximum-isolation", "normal-development", "restricted-development", "custom"])
+        self.lifecycle_input = combo(["Persistente", "Excluir manualmente", "Excluir ao fechar o IsolateVM",
+                                      "Restaurar snapshot inicial ao fechar",
+                                      "Persistir somente /workspace"])
+        self.workspace_size_input = Gtk.SpinButton.new_with_range(1, 2048, 1)
+        self.workspace_size_input.set_value(20)
+        self.workspace_size_input.set_sensitive(False)
+        self.lifecycle_input.connect("changed", lambda combo: self.workspace_size_input.set_sensitive(
+            combo.get_active() == 4))
         self.mount_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.mount_empty_label = label("Nenhuma pasta do host compartilhada", "muted")
         self.mount_list.append(self.mount_empty_label)
         self.mount_rows: list[MountEditor] = []
         self.add_mount_button = button("+ Compartilhar pasta…", self._add_mount_row)
+        self.copy_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.copy_empty_label = label("Nenhum arquivo ou pasta marcado para cópia única", "muted")
+        self.copy_list.append(self.copy_empty_label)
+        self.copy_rows: list[CopyEditor] = []
+        self.add_copy_file_button = button("+ Copiar arquivo uma vez…", lambda: self._add_copy_row("file"))
+        self.add_copy_folder_button = button("+ Copiar pasta uma vez…", lambda: self._add_copy_row("directory"))
         self.apt_input = entry()
         self.pip_input = entry()
+        self.pipx_input = entry()
         self.npm_input = entry()
         self.cargo_input = entry()
         self.go_input = entry()
         self._original_apt_order: tuple[str, ...] = ()
+        self._original_pipx_order: tuple[str, ...] = ()
+        self._original_npm_order: tuple[str, ...] = ()
+        self._original_external_order: tuple[str, ...] = ()
         self.catalog_checks: dict[str, Gtk.CheckButton] = {}
         self.catalog_sections: list[Gtk.Expander] = []
         for title, items in CATALOG_GROUPS:
@@ -75,22 +104,30 @@ class WizardMixin:
             body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             body.set_margin_start(12); body.set_margin_top(6); body.set_margin_bottom(6)
             for item in items:
-                check = Gtk.CheckButton(label=f"{item.label} · {item.package}")
+                manager_label = {"apt": "APT", "pipx": "PyPI / pipx", "npm": "npm global",
+                                 "external": "APT upstream assinado"}[item.manager]
+                check = Gtk.CheckButton(label=f"{item.label} · {item.package} · {manager_label}")
                 if item.package in {"docker.io", "podman"}:
                     check.set_tooltip_text("Instala dentro da VM; recursos de contêiner podem exigir suporte adicional do guest")
-                self.catalog_checks[item.package] = check
+                if item.package == "rustup":
+                    check.set_tooltip_text("Instala e define a toolchain stable para ubuntu no primeiro boot; o alias stable acompanha novas versões.")
+                key = item.package if item.manager == "apt" else f"{item.manager}:{item.package}"
+                self.catalog_checks[key] = check
                 body.append(check)
             section.set_child(body)
             self.catalog_sections.append(section)
         self.python_check = Gtk.CheckButton(label="Python (python3, python3-pip)")
         self.node_check = Gtk.CheckButton(label="Node.js (nodejs, npm)")
         self.rust_check = Gtk.CheckButton(label="Rust (rustc, cargo)")
+        self.dotnet8_check = Gtk.CheckButton(label="SDK .NET 8.0 · feeds Ubuntu 22.04/24.04")
+        self.dotnet10_check = Gtk.CheckButton(label="SDK .NET 10.0 · feeds Ubuntu 24.04/26.04")
         self.codex_check = Gtk.CheckButton(label="OpenAI Codex CLI na VM (npm, sem credenciais)")
         self.environment_view = Gtk.TextView()
         self.environment_view.set_monospace(True)
         self.environment_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.environment_view.set_size_request(-1, 120)
-        self.save_template_check = Gtk.CheckButton(label="Salvar como template sem paths pessoais")
+        self.secret_ref_names: set[str] = set()
+        self.save_template_check = Gtk.CheckButton(label="Salvar como template sem caminhos pessoais de mounts e cópias")
         self._render_step()
 
     def _render_step(self) -> None:
@@ -128,24 +165,38 @@ class WizardMixin:
             self.step_body.append(label("Rede restrita usa proxy HTTPS por VM, bloqueia DNS e tráfego direto. Domínios são resolvidos pelo proxy; UDP não é permitido.", "risk"))
         elif self.wizard_step == 5:
             self.step_body.append(label("Acessos ao Host", "section-title"))
+            self.step_body.append(label("COMPARTILHAR PERMANENTEMENTE · a pasta continua ligada ao host", "section-title"))
             self.step_body.append(self.mount_list)
             self.step_body.append(self.add_mount_button)
             self.add_mount_button.set_sensitive(len(self.mount_rows) < 16)
-            self.step_body.append(label("Pasta compartilhada permanece vinculada ao host. Nenhuma pasta é copiada automaticamente.", "muted"))
+            self.step_body.append(label("Escolha RO ou RW. A VM mantém acesso à pasta enquanto o dispositivo Incus estiver anexado.", "muted"))
+            self.step_body.append(label("COPIAR UMA VEZ · arquivos entram no disco da VM", "section-title"))
+            self.step_body.append(self.copy_list)
+            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            controls.append(self.add_copy_file_button)
+            controls.append(self.add_copy_folder_button)
+            self.step_body.append(controls)
+            for widget in (self.add_copy_file_button, self.add_copy_folder_button):
+                widget.set_sensitive(len(self.copy_rows) < 16)
+            self.step_body.append(label("Cópias são enviadas pelo agente Incus após o primeiro start, sem mount permanente. Os arquivos ficam no disco e em backups da VM; alteração posterior no host não os atualiza.", "risk"))
         elif self.wizard_step == 6:
-            self.step_body.append(label("Selecione pacotes por categoria. Todos serão registrados como APT no manifesto.", "muted"))
+            self.step_body.append(label("Selecione software por categoria. O manifesto registra o pacote, gerenciador e versão escolhidos.", "muted"))
             for section in self.catalog_sections:
                 self.step_body.append(section)
             self.step_body.append(row("Outros pacotes APT (separados por vírgula)", self.apt_input))
             self.step_body.append(row("Pacotes Python no venv da VM (nome ou nome==versão)", self.pip_input))
+            self.step_body.append(row("Aplicativos CLI via pipx (nome ou nome==versão)", self.pipx_input))
             self.step_body.append(row("Pacotes npm globais na VM (nome ou nome@versão)", self.npm_input))
             self.step_body.append(row("Crates Cargo (crate@X.Y.Z)", self.cargo_input))
             self.step_body.append(row("Ferramentas Go (módulo/comando@vX.Y.Z)", self.go_input))
-            self.step_body.append(label("Instalação via cloud-init no primeiro boot. No modo offline, downloads podem falhar.", "muted"))
-            self.step_body.append(label("Cargo e Go exigem versão exata. Docker/Podman rodam no guest; disponibilidade de recursos de contêiner depende da VM. .NET, uv, rustup, bun, kubectl, Helm e Terraform ainda não têm seleção assistida.", "risk"))
+            self.step_body.append(label("Instalação via cloud-init no primeiro boot. Os presets Python e npm têm versões fixas; transitive dependencies e pacotes APT seguem os repositórios do guest. No modo offline, downloads podem falhar.", "muted"))
+            self.step_body.append(label("Rustup instala e define o canal stable, que pode avançar entre execuções; ele conflita com o preset Rust dos repositórios Ubuntu. Docker/Podman rodam no guest e podem exigir suporte adicional. kubectl segue o canal Kubernetes 1.37; Helm usa um repositório APT comunitário mantido pela Buildkite, não pelo projeto Helm; Terraform usa o repositório assinado pela HashiCorp. Esses repositórios acompanham as versões disponíveis e exigem rede no guest.", "risk"))
         elif self.wizard_step == 7:
             for widget in (self.python_check, self.node_check, self.rust_check):
                 self.step_body.append(widget)
+            self.step_body.append(self.dotnet8_check)
+            self.step_body.append(self.dotnet10_check)
+            self.step_body.append(label(".NET 8.0 não está na feed padrão Ubuntu 26.04; .NET 10.0 não está na feed padrão 22.04. O wizard rejeita essas combinações sem uma fonte explícita.", "muted"))
             self.step_body.append(label("AI Coding", "section-title"))
             self.step_body.append(self.codex_check)
             self.step_body.append(label("Codex é instalado dentro da VM. Faça login apenas na primeira execução na VM; nenhuma autenticação do host é copiada.", "muted"))
@@ -153,6 +204,17 @@ class WizardMixin:
             self.step_body.append(label("Somente valores não secretos. Uma linha NOME=VALOR por variável.", "risk"))
             self.step_body.append(self.environment_view)
             self.step_body.append(label("Os valores serão incluídos no manifesto exportado, na configuração Incus e em /etc/environment da VM.", "muted"))
+            self.step_body.append(label("Secrets para o guest", "section-title"))
+            self.step_body.append(label("O manifesto guarda apenas nomes. Valores ficam no cofre do usuário e só são enviados à VM por ação separada após a criação.", "muted"))
+            if not self.secret_ref_names:
+                self.step_body.append(label("Nenhuma referência de secret selecionada", "muted"))
+            for name in sorted(self.secret_ref_names):
+                strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                strip.append(label(name))
+                strip.append(button("Remover referência", lambda n=name: self._remove_secret_reference(n)))
+                self.step_body.append(strip)
+            self.step_body.append(button("Referenciar um secret existente…", self._choose_secret_reference))
+            self.step_body.append(button("Salvar/atualizar um secret…", lambda: self._secret_value_dialog(self._add_secret_reference)))
         elif self.wizard_step == 9:
             try:
                 manifest = self._form_manifest()
@@ -170,8 +232,12 @@ class WizardMixin:
                 self.step_body.append(label("Ajuste os dados nas etapas anteriores ou selecione o perfil apropriado na próxima etapa.", "muted"))
         elif self.wizard_step == 10:
             self.step_body.append(row("Perfil de segurança", self.security_profile_input))
-            self.step_body.append(label("Máximo isolamento: sem NIC, mounts, dispositivos repassados ou secrets. Desenvolvimento normal/custom: somente acessos escolhidos explicitamente.", "muted"))
-            self.step_body.append(label("Desenvolvimento restrito indisponível: falta proxy de saída com allowlist e DNS controlado.", "risk"))
+            self.step_body.append(label("Máximo isolamento: sem NIC, mounts, dispositivos repassados ou secrets. Outros perfis permitem somente concessões explícitas; secrets exigem entrega separada ao guest.", "muted"))
+            self.step_body.append(label("Desenvolvimento restrito usa o proxy de saída por VM e a allowlist TCP revisada na etapa Rede.", "muted"))
+            self.step_body.append(row("Ciclo de vida", self.lifecycle_input))
+            self.step_body.append(row("Tamanho persistente de /workspace (GiB)", self.workspace_size_input))
+            self.workspace_size_input.set_sensitive(self.lifecycle_input.get_active() == 4)
+            self.step_body.append(label("Persistir somente /workspace usa um volume Incus separado, sem caminho do host; no primeiro boot, o cloud-init prepara o diretório para ubuntu. Ao fechar, a VM volta ao snapshot inicial e mantém esse volume. Excluir ao fechar apaga a VM; restaurar snapshot inicial apaga mudanças no disco. Nenhuma ação ocorre após encerramento forçado. O backup completo da VM não inclui o volume /workspace; exporte-o separadamente.", "risk"))
         elif self.wizard_step in (11, 12):
             try:
                 self.current_manifest = self._form_manifest()
@@ -182,7 +248,9 @@ class WizardMixin:
                     self.step_body.append(self.save_template_check)
                     self.step_body.append(button("Simular criação", self._dry_run))
                     self.step_body.append(button("Salvar template", self._save_current_template))
+                    self.step_body.append(button("Salvar nova versão do template", self._save_current_template_versioned))
                     self.step_body.append(button("Exportar manifesto…", self._export_current))
+                    self.step_body.append(button("Exportar nova versão no HOME", lambda: self._export_versioned(self.current_manifest)))
                 else:
                     self.step_body.append(label("A VM será criada parada. Confirme a operação no próximo diálogo.", "risk"))
             except Exception as exc:
@@ -205,17 +273,79 @@ class WizardMixin:
             result[name] = value
         return result
 
+    def _add_secret_reference(self, name: str) -> None:
+        self.secret_ref_names.add(name)
+        if self.wizard_step == 8:
+            self._render_step()
+
+    def _remove_secret_reference(self, name: str) -> None:
+        self.secret_ref_names.discard(name)
+        self._render_step()
+
+    def _choose_secret_reference(self) -> None:
+        dialog = Gtk.Dialog(title="Referenciar um secret do cofre", transient_for=self, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        use_button = dialog.add_button("Adicionar referência", Gtk.ResponseType.OK)
+        use_button.set_sensitive(False)
+        content = dialog.get_content_area()
+        content.set_spacing(8); content.set_margin_start(16); content.set_margin_end(16)
+        content.set_margin_top(12); content.set_margin_bottom(12)
+        content.append(label("São exibidos somente nomes; valores nunca aparecem nesta lista.", "muted"))
+        status = label("Lendo nomes do cofre…", "muted")
+        content.append(status)
+        chooser = Gtk.ComboBoxText()
+        content.append(chooser)
+        names: list[str] = []
+
+        def loaded(values: object) -> None:
+            names.extend(str(value) for value in values if isinstance(value, str))
+            for name in names:
+                chooser.append_text(name)
+            chooser.set_active(0 if names else -1)
+            use_button.set_sensitive(bool(names))
+            status.set_text("Escolha um nome para referenciar." if names else "Cofre vazio; salve um secret primeiro.")
+
+        self._work(self.secret_vault.names, loaded,
+                   lambda exc: status.set_text("Cofre indisponível: " + str(exc)))
+
+        def response(d: Gtk.Dialog, response_id: int) -> None:
+            selected = chooser.get_active()
+            d.destroy()
+            if response_id == Gtk.ResponseType.OK and 0 <= selected < len(names):
+                self._add_secret_reference(names[selected])
+
+        dialog.connect("response", response)
+        dialog.present()
+
     def _form_manifest(self) -> Manifest:
         requested_apt = [x.strip() for x in self.apt_input.get_text().split(",") if x.strip()]
-        requested_apt.extend(package for package, check in self.catalog_checks.items() if check.get_active())
+        requested_pipx = [x.strip() for x in self.pipx_input.get_text().split(",") if x.strip()]
+        requested_npm = [x.strip() for x in self.npm_input.get_text().split(",") if x.strip()]
+        requested_external: list[str] = []
+        for key, check in self.catalog_checks.items():
+            if not check.get_active():
+                continue
+            manager, package = (("apt", key) if ":" not in key else key.split(":", 1))
+            {"apt": requested_apt, "pipx": requested_pipx, "npm": requested_npm,
+             "external": requested_external}[manager].append(package)
         if self.python_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["python"])
         if self.node_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["node"])
         if self.rust_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["rust"])
+        if self.dotnet8_check.get_active(): requested_apt.append("dotnet-sdk-8.0")
+        if self.dotnet10_check.get_active(): requested_apt.append("dotnet-sdk-10.0")
         requested_apt = list(dict.fromkeys(requested_apt))
         packages = [package for package in self._original_apt_order if package in requested_apt]
         packages.extend(package for package in requested_apt if package not in packages)
         pip_packages = [x.strip() for x in self.pip_input.get_text().split(",") if x.strip()]
-        npm_packages = [x.strip() for x in self.npm_input.get_text().split(",") if x.strip()]
+        pipx_packages = list(dict.fromkeys(requested_pipx))
+        ordered_pipx = [package for package in self._original_pipx_order if package in pipx_packages]
+        ordered_pipx.extend(package for package in pipx_packages if package not in ordered_pipx)
+        npm_packages = list(dict.fromkeys(requested_npm))
+        ordered_npm = [package for package in self._original_npm_order if package in npm_packages]
+        ordered_npm.extend(package for package in npm_packages if package not in ordered_npm)
+        external_tools = list(dict.fromkeys(requested_external))
+        ordered_external = [package for package in self._original_external_order if package in external_tools]
+        ordered_external.extend(package for package in external_tools if package not in ordered_external)
         cargo_packages = [x.strip() for x in self.cargo_input.get_text().split(",") if x.strip()]
         go_packages = [x.strip() for x in self.go_input.get_text().split(",") if x.strip()]
         if self.codex_check.get_active(): npm_packages.append("@openai/codex@latest")
@@ -237,6 +367,11 @@ class WizardMixin:
                 kind = "cidr" if "/" in target else ("ip" if target.replace(".", "").isdigit() else "domain")
                 if not port.isdigit(): raise ValidationError("Saída restrita: porta inválida")
                 egress.append({"kind": kind, "value": target, "port": int(port), "protocol": "tcp"})
+        lifecycle_disposition = ("persistent", "manual-delete", "delete-on-close",
+                                 "restore-initial-on-close", "persist-workspace")[self.lifecycle_input.get_active()]
+        lifecycle = {"disposition": lifecycle_disposition}
+        if lifecycle_disposition == "persist-workspace":
+            lifecycle["workspaceSizeGiB"] = self.workspace_size_input.get_value_as_int()
         raw = {"schemaVersion": 1, "name": self.name_input.get_text().strip(),
                "os": {"distribution": "ubuntu", "release": self.release_input.get_active_text(),
                       **({"desktop": ("gnome", "kde", "xfce")[self.desktop_input.get_active()]}
@@ -247,8 +382,15 @@ class WizardMixin:
                "network": {"mode": mode, **({"bridge": self.bridge_input.get_text().strip()} if mode in {"normal", "restricted"} else {}),
                            **({"egress": egress} if egress else {})},
                "security": {"profile": "restricted-development" if mode == "restricted" else self.security_profile_input.get_active_text()},
-               "mounts": mounts, "software": {"apt": packages, "pip": pip_packages, "npm": npm_packages,
+               "lifecycle": lifecycle,
+               "mounts": mounts,
+               "copies": [{"host": editor.host.get_text().strip(), "guest": editor.guest.get_text().strip(),
+                           "kind": editor.kind, "includeHidden": editor.include_hidden.get_active()}
+                          for editor in self.copy_rows],
+               "software": {"apt": packages, "pip": pip_packages, "pipx": ordered_pipx,
+                            "npm": ordered_npm, "external": ordered_external,
                                               "cargo": cargo_packages, "go": go_packages},
+               "secrets": sorted(self.secret_ref_names),
                "environment": self._environment(),
                "metadata": {}}
         return Manifest.parse(raw)
@@ -295,6 +437,60 @@ class WizardMixin:
                 pass
         chooser.select_folder(self, None, selected)
 
+    def _add_copy_row(self, kind: str, copy: CopySpec | None = None) -> None:
+        if len(self.copy_rows) >= 16:
+            self._toast("Máximo de 16 origens para cópia única")
+            return
+        if not self.copy_rows:
+            self.copy_list.remove(self.copy_empty_label)
+        frame = Gtk.Frame()
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        body.set_margin_start(10); body.set_margin_end(10)
+        body.set_margin_top(10); body.set_margin_bottom(10)
+        frame.set_child(body)
+        host = entry(copy.host if copy else "")
+        default_target = "/home/ubuntu/imports/" + ("new-file" if kind == "file" else "new-folder")
+        guest = entry(copy.guest if copy else default_target)
+        include_hidden = Gtk.CheckButton(label="Incluir arquivos ocultos desta origem")
+        include_hidden.set_active(bool(copy and copy.include_hidden))
+        editor = CopyEditor(frame, host, guest, kind, include_hidden)
+        body.append(label("CÓPIA ÚNICA · ARQUIVO" if kind == "file" else "CÓPIA ÚNICA · PASTA", "section-title"))
+        body.append(row("Origem no host", host))
+        body.append(button("Escolher arquivo…" if kind == "file" else "Escolher pasta…",
+                           lambda: self._choose_copy_source(editor)))
+        body.append(row("Destino dentro de /home/ubuntu", guest))
+        body.append(include_hidden)
+        body.append(label("Ocultos podem conter credenciais. Caminhos sensíveis conhecidos, symlinks e dispositivos são bloqueados.", "risk"))
+        body.append(button("Remover esta cópia", lambda: self._remove_copy_row(editor), "destructive-action"))
+        self.copy_rows.append(editor)
+        self.copy_list.append(frame)
+        for widget in (self.add_copy_file_button, self.add_copy_folder_button):
+            widget.set_sensitive(len(self.copy_rows) < 16)
+
+    def _remove_copy_row(self, editor: CopyEditor) -> None:
+        self.copy_list.remove(editor.frame)
+        self.copy_rows.remove(editor)
+        if not self.copy_rows:
+            self.copy_list.append(self.copy_empty_label)
+        for widget in (self.add_copy_file_button, self.add_copy_folder_button):
+            widget.set_sensitive(True)
+
+    def _choose_copy_source(self, editor: CopyEditor) -> None:
+        chooser = Gtk.FileDialog(title="Escolher origem para cópia única")
+        def selected(dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+            try:
+                chosen = (dialog.open_finish(result) if editor.kind == "file" else
+                          dialog.select_folder_finish(result))
+                path = chosen.get_path()
+                if path:
+                    editor.host.set_text(path)
+                    if editor.guest.get_text().endswith("/new-file") or editor.guest.get_text().endswith("/new-folder"):
+                        editor.guest.set_text("/home/ubuntu/imports/" + Path(path).name)
+            except GLib.Error:
+                pass
+        if editor.kind == "file": chooser.open(self, None, selected)
+        else: chooser.select_folder(self, None, selected)
+
     def _back(self) -> None:
         self.wizard_step -= 1; self._render_step()
 
@@ -303,7 +499,9 @@ class WizardMixin:
             self.wizard_step += 1; self._render_step(); return
         manifest = self.current_manifest
         if not manifest: return
-        self._confirm("Criar VM Incus?", "A imagem poderá ser baixada e um disco criado. Nenhuma configuração global do host será alterada.",
+        copy_note = (f" {len(manifest.copies)} cópia(s) serão enviadas ao disco da VM após o primeiro start."
+                     if manifest.copies else "")
+        self._confirm("Criar VM Incus?", "A imagem poderá ser baixada e um disco criado. Nenhuma configuração global do host será alterada." + copy_note,
                       lambda: self._create(manifest))
 
     def _create(self, manifest: Manifest) -> None:
@@ -326,14 +524,15 @@ class WizardMixin:
                     audit("create", manifest.name, "ok")
                     save_instance_manifest(manifest)
                     if save_template_requested:
-                        save_template(manifest.name, manifest); audit("template", manifest.name, "ok")
-                except OSError as exc:
+                        save_template_versioned(manifest.name, manifest); audit("template", manifest.name, "ok")
+                except (OSError, ValidationError) as exc:
                     GLib.idle_add(self._toast, f"VM criada; registro local incompleto: {exc}")
             finally:
                 GLib.idle_add(self.next_btn.set_sensitive, True)
         def done(_: object) -> None:
             self.next_btn.set_sensitive(True)
-            self._toast(f"VM {manifest.name} criada e parada. Inicie pelo dashboard.")
+            self._toast(f"VM {manifest.name} criada e parada. Inicie pelo dashboard." +
+                        (" Cópias aguardam o primeiro start." if manifest.copies else ""))
             self.show_dashboard()
         self._work(run, done)
 
@@ -368,11 +567,24 @@ class WizardMixin:
         if not manifest: return
         self._ask("Nome do template", manifest.name, lambda name: self._save_template(name, manifest))
 
+    def _save_current_template_versioned(self) -> None:
+        manifest = self.current_manifest
+        if not manifest: return
+        self._ask("Nome-base do template", manifest.name,
+                  lambda name: self._save_template_versioned(name, manifest))
+
     def _save_template(self, name: str, manifest: Manifest) -> None:
         try:
             path = save_template(name, manifest)
             audit("template", manifest.name, "ok")
-            self._toast(f"Template salvo em {path}; mounts pessoais foram removidos.")
+            self._toast(f"Template salvo em {path}; mounts e fontes de cópia pessoais foram removidos.")
+        except Exception as exc: self._toast(str(exc))
+
+    def _save_template_versioned(self, name: str, manifest: Manifest) -> None:
+        try:
+            path = save_template_versioned(name, manifest)
+            audit("template", manifest.name, "ok")
+            self._toast(f"Nova versão de template salva em {path}; caminhos pessoais foram removidos.")
         except Exception as exc: self._toast(str(exc))
 
     def _export_current(self) -> None:
@@ -390,7 +602,8 @@ class WizardMixin:
     def show_templates(self) -> None:
         self._clear(self.templates_page)
         self.templates_page.append(label("Templates", "page-title"))
-        self.templates_page.append(label("Templates locais excluem mounts e secrets. Importações passam pelo mesmo validador do wizard.", "muted"))
+        self.templates_page.append(label("Templates locais removem mounts e fontes pessoais de cópia; guardam apenas referências de secrets, nunca valores.", "muted"))
+        self.templates_page.append(label("A importação valida o schema e abre a revisão do wizard antes de qualquer criação Incus.", "muted"))
         self.templates_page.append(button("Importar manifesto…", lambda: self._ask("Caminho do arquivo YAML", "", self._import_from)))
         for name in templates():
             self.templates_page.append(button(name, lambda n=name: self._use_template(n)))
@@ -421,24 +634,50 @@ class WizardMixin:
         self.network_input.set_active({"offline": 0, "normal": 1, "restricted": 2}[manifest.networkMode])
         profiles = ["maximum-isolation", "normal-development", "restricted-development", "custom"]
         self.security_profile_input.set_active(profiles.index(manifest.securityProfile))
+        self.lifecycle_input.set_active({"persistent": 0, "manual-delete": 1,
+                                         "delete-on-close": 2,
+                                         "restore-initial-on-close": 3,
+                                         "persist-workspace": 4}[manifest.lifecycleDisposition])
+        self.workspace_size_input.set_value(manifest.workspaceSizeGiB or 20)
         self.bridge_input.set_text(manifest.bridge or "incusbr0")
         self.egress_input.set_text(", ".join(f"{rule.value}:{rule.port}" for rule in manifest.egress))
         self._original_apt_order = manifest.apt
+        self._original_pipx_order = manifest.pipx
+        self._original_npm_order = manifest.npm
+        self._original_external_order = manifest.externalTools
         selected_apt = set(manifest.apt)
-        for package, check in self.catalog_checks.items():
-            check.set_active(package in selected_apt)
+        selected_pipx = set(manifest.pipx)
+        selected_npm = set(manifest.npm)
+        selected_external = set(manifest.externalTools)
+        for key, check in self.catalog_checks.items():
+            manager, package = (("apt", key) if ":" not in key else key.split(":", 1))
+            selected = {"apt": selected_apt, "pipx": selected_pipx,
+                        "npm": selected_npm, "external": selected_external}[manager]
+            check.set_active(package in selected)
         selected_presets: set[str] = set()
         for key, check in (("python", self.python_check), ("node", self.node_check), ("rust", self.rust_check)):
             enabled = all(package in selected_apt for package in LANGUAGE_PRESETS[key])
             check.set_active(enabled)
             if enabled: selected_presets.update(LANGUAGE_PRESETS[key])
+        self.dotnet8_check.set_active("dotnet-sdk-8.0" in selected_apt)
+        self.dotnet10_check.set_active("dotnet-sdk-10.0" in selected_apt)
         self.apt_input.set_text(",".join(package for package in manifest.apt
-                                         if package not in CATALOG_PACKAGES and package not in selected_presets))
+                                         if package not in APT_CATALOG_PACKAGES and
+                                         package not in DOTNET_SDK_PACKAGES and
+                                         package not in selected_presets))
         self.pip_input.set_text(",".join(manifest.pip))
-        self.npm_input.set_text(",".join(x for x in manifest.npm if x != "@openai/codex@latest"))
+        self.pipx_input.set_text(",".join(package for package in manifest.pipx
+                                         if package not in PIPX_CATALOG_PACKAGES))
+        self.npm_input.set_text(",".join(x for x in manifest.npm
+                                         if x not in NPM_CATALOG_PACKAGES and x != "@openai/codex@latest"))
         self.cargo_input.set_text(",".join(manifest.cargo))
         self.go_input.set_text(",".join(manifest.go))
         self.environment_view.get_buffer().set_text("\n".join(f"{key}={value}" for key, value in manifest.environment))
+        self.secret_ref_names = set(manifest.secrets)
+        for editor in tuple(self.copy_rows):
+            self._remove_copy_row(editor)
+        for copy in manifest.copies:
+            self._add_copy_row(copy.kind, copy)
         self.codex_check.set_active("@openai/codex@latest" in manifest.npm)
         for editor in tuple(self.mount_rows):
             self._remove_mount_row(editor)

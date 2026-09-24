@@ -17,10 +17,15 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 from .diagnostics import diagnose
 from .incus import IncusError, IncusService, LocalIncus, VM
 from .mock import MockIncus
-from .model import Manifest, ValidationError
+from .model import INITIAL_SNAPSHOT, Manifest, ValidationError
 from .metrics import MetricsSnapshot, cpu_percent_between
 from .storage import (audit, complete_onboarding, first_run, history, load_instance_manifest,
-                      load_theme, remove_instance_manifest, save_instance_manifest, save_theme)
+                      load_theme, load_auto_snapshot, remove_instance_manifest,
+                      save_auto_snapshot, save_instance_manifest, save_theme,
+                      export_manifest_versioned)
+from .secret_vault import SecretVault, validate_secret_name, validate_secret_value
+from .snapshot_policy import PROTECTED_ACTIONS, protection_name
+from . import change_diff as diff
 
 
 from .ui_widgets import CSS, label, button, row, entry, combo
@@ -34,12 +39,16 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         super().__init__(application=app, title="IsolateVM")
         self.set_default_size(1100, 730)
         self.mock = os.environ.get("ISOLATEVM_MOCK") == "1"
+        self.secret_vault = SecretVault()
         self.service: IncusService = MockIncus() if self.mock else self._live_service()
         self.current_manifest: Manifest | None = None
         self.selected_vm: VM | None = None
         self.wizard_step = 0
         self._metrics_generation = 0
         self._dashboard_generation = 0
+        self._allow_close = False
+        self._close_scan_pending = False
+        self.connect("close-request", self._close_requested)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -138,6 +147,47 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         dialog.connect("response", lambda d, *_: d.destroy())
         dialog.present()
 
+    def _secret_value_dialog(self, on_saved: Callable[[str], None], preset_name: str = "") -> None:
+        dialog = Gtk.Dialog(title="Salvar secret no cofre do usuário", transient_for=self, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Salvar no cofre", Gtk.ResponseType.OK)
+        content = dialog.get_content_area()
+        content.set_spacing(10); content.set_margin_start(16); content.set_margin_end(16)
+        content.set_margin_top(12); content.set_margin_bottom(12)
+        name = entry(preset_name)
+        name.set_editable(not bool(preset_name))
+        password = Gtk.PasswordEntry()
+        password.set_placeholder_text("Valor oculto; não será exibido novamente")
+        content.append(row("Referência de ambiente", name))
+        content.append(row("Valor do secret", password))
+        content.append(label("O valor vai para o Secret Service do usuário. O IsolateVM não o grava no manifesto, histórico ou configuração Incus.", "muted"))
+
+        def response(d: Gtk.Dialog, response_id: int) -> None:
+            secret_name, secret_value = name.get_text().strip(), password.get_text()
+            password.set_text("")
+            d.destroy()
+            if response_id != Gtk.ResponseType.OK:
+                return
+            try:
+                secret_name = validate_secret_name(secret_name)
+                secret_value = validate_secret_value(secret_value)
+            except Exception as exc:
+                self._toast(str(exc)); return
+
+            def store() -> str:
+                self.secret_vault.store(secret_name, secret_value)
+                return secret_name
+
+            def saved(result: object) -> None:
+                try: audit("secret-store", "host-vault", "ok")
+                except OSError: pass
+                on_saved(str(result))
+
+            self._work(store, saved)
+
+        dialog.connect("response", response)
+        dialog.present()
+
     def _ask(self, title: str, initial: str, callback: Callable[[str], None]) -> None:
         dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
         dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
@@ -162,6 +212,42 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             if response == Gtk.ResponseType.OK: callback()
         dialog.connect("response", answer)
         dialog.present()
+
+    def _review_change(self, name: str, action: str,
+                       preview: Callable[[dict], diff.ChangePreview],
+                       change: Callable[[], None], done: Callable[[], None] | None = None) -> None:
+        def show(effective: object) -> None:
+            try:
+                result = preview(effective)
+            except Exception as exc:
+                self._error_dialog(exc)
+                return
+            detail = result.text()
+            if action in PROTECTED_ACTIONS and load_auto_snapshot():
+                detail += "\n\nAntes da mudança, será criado um snapshot de proteção. Se ele falhar, a mudança não será aplicada."
+            dialog = Gtk.Dialog(title=f"Revisar alteração · {name}", transient_for=self, modal=True)
+            dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+            dialog.add_button("Aplicar alterações", Gtk.ResponseType.OK)
+            dialog.set_default_size(690, 360)
+            scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+            content = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                   wrap_mode=Gtk.WrapMode.WORD_CHAR)
+            content.set_margin_start(16); content.set_margin_end(16)
+            content.set_margin_top(14); content.set_margin_bottom(14)
+            content.get_buffer().set_text(detail)
+            scroller.set_child(content)
+            dialog.get_content_area().append(scroller)
+            def answer(window: Gtk.Dialog, response: int) -> None:
+                window.destroy()
+                if response == Gtk.ResponseType.OK:
+                    def check_reviewed_state() -> None:
+                        current = preview(self.service.effective(name))
+                        if current != result:
+                            raise ValidationError("A configuração efetiva mudou desde a prévia; revise novamente")
+                    self._audited(action, name, change, done, check_reviewed_state)
+            dialog.connect("response", answer)
+            dialog.present()
+        self._work(lambda: self.service.effective(name), show)
 
     def _work(self, fn: Callable[[], object], done: Callable[[object], None] | None = None,
               on_error: Callable[[Exception], None] | None = None) -> None:
@@ -251,7 +337,19 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         card.append(label(f"{vm.name}    •    {vm.status}", "section-title"))
         card.append(label(f"{vm.os}  ·  {vm.cpu} CPU  ·  {vm.memory} RAM  ·  {vm.disk} disco  ·  IP {vm.ip}"))
         card.append(label(f"Perfil: {vm.security_profile}  ·  Rede: {vm.network_policy}", "muted"))
+        if vm.lifecycle_disposition != "persistent":
+            lifecycle = {"manual-delete": "descartável · excluir manualmente",
+                         "delete-on-close": "descartável · excluir ao fechar",
+                         "restore-initial-on-close": "descartável · restaurar inicial ao fechar",
+                         "persist-workspace": "restaurar sistema ao fechar · manter /workspace"}.get(
+                             vm.lifecycle_disposition, "ciclo de vida desconhecido")
+            card.append(label("Ciclo de vida: " + lifecycle,
+                              "risk" if vm.lifecycle_disposition in {"delete-on-close", "restore-initial-on-close", "persist-workspace"} else "muted"))
         card.append(label(f"Mounts: {vm.mounts}  ·  Snapshots: {vm.snapshots}", "muted"))
+        if vm.copy_state == "pending":
+            card.append(label("Cópias únicas pendentes · arquivos ainda não foram colocados no disco da VM", "risk"))
+        elif vm.copy_state == "done":
+            card.append(label("Cópias únicas concluídas · sem vínculo contínuo com o host", "muted"))
         if vm.status == "Running":
             if usage:
                 snapshot, cpu_percent = usage
@@ -269,7 +367,10 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         actions = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
                               max_children_per_line=5, row_spacing=6, column_spacing=6)
         for text, action in [("Iniciar", "start"), ("Parar", "stop"), ("Reiniciar", "restart")]:
-            actions.append(button(text, lambda a=action: self._state(vm.name, a)))
+            actions.append(button(text, lambda a=action, pending=(vm.copy_state == "pending"):
+                                  self._state(vm.name, a, pending)))
+        if vm.status == "Running" and vm.copy_state == "pending":
+            actions.append(button("Aplicar cópias pendentes", lambda: self._apply_copies(vm.name)))
         if vm.status == "Running":
             actions.append(button("Forçar parada", lambda: self._confirm(
                 "Forçar parada da VM?", "A VM será interrompida imediatamente. Dados não gravados dentro dela podem ser perdidos.",
@@ -288,20 +389,185 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         actions.append(button("Snapshots…", lambda: self.show_effective(vm.name)))
         actions.append(button("Clonar", lambda: self._ask("Nome da cópia", vm.name + "-copy", lambda s: self._clone(vm.name, s))))
         actions.append(button("Exportar YAML", lambda: self._export_vm(vm.name)))
+        actions.append(button("Exportar versão", lambda: self._export_vm_versioned(vm.name)))
         backup = button("Backup completo", lambda: self._ask(
             "Arquivo de backup .tar.gz", str(Path.home() / f"{vm.name}.tar.gz"),
             lambda path: self._backup_prompt(vm.name, path)))
         backup.set_sensitive(not self.mock)
         if self.mock: backup.set_tooltip_text("Backup completo exige uma VM Incus real")
         actions.append(backup)
-        actions.append(button("Excluir", lambda: self._delete_prompt(vm.name), "destructive-action"))
+        if vm.lifecycle_disposition == "persist-workspace":
+            workspace_backup = button("Exportar /workspace", lambda: self._ask(
+                "Arquivo de exportação .tar.gz", str(Path.home() / f"{vm.name}-workspace.tar.gz"),
+                lambda path: self._workspace_backup_prompt(vm.name, path)))
+            workspace_backup.set_sensitive(not self.mock)
+            if self.mock: workspace_backup.set_tooltip_text("Exportação de /workspace exige uma VM Incus real")
+            actions.append(workspace_backup)
+        actions.append(button("Excluir", lambda: self._delete_prompt(
+            vm.name, workspace=vm.lifecycle_disposition == "persist-workspace"), "destructive-action"))
         card.append(actions)
         parent.append(card)
 
+    def _close_requested(self, *_args) -> bool:
+        if self._allow_close or self.mock or not isinstance(self.service, LocalIncus):
+            return False
+        if self.service.confined_connection_pending:
+            return False
+        if self._close_scan_pending:
+            return True
+        self._close_scan_pending = True
+        self._work(self._disposable_close_targets, self._review_close_targets,
+                   self._close_scan_failed)
+        return True
+
+    def _disposable_close_targets(self) -> list[tuple[str, str, str]]:
+        candidates: list[tuple[str, str, str]] = []
+        for vm in self.service.list_vms():
+            disposition = vm.lifecycle_disposition
+            if disposition not in {"delete-on-close", "restore-initial-on-close", "persist-workspace"}:
+                continue
+            try:
+                manifest = load_instance_manifest(vm.name)
+                verified = self.service.verify_managed_lifecycle(
+                    vm.name, disposition, manifest.pool, manifest.workspaceSizeGiB)
+            except (OSError, ValidationError, IncusError):
+                continue
+            if (manifest.name != vm.name or manifest.lifecycleDisposition != disposition or
+                    not verified):
+                continue
+            candidates.append((vm.name, vm.status, disposition))
+        return candidates
+
+    def _review_close_targets(self, targets: list[tuple[str, str, str]]) -> None:
+        if not targets:
+            self._allow_close = True
+            self.close()
+            return
+        descriptions = {"delete-on-close": "excluir VM e snapshots",
+                        "restore-initial-on-close": "restaurar snapshot inicial",
+                        "persist-workspace": "restaurar sistema · manter volume /workspace"}
+        lines = [f"{name} · {status} · {descriptions[disposition]}"
+                 for name, status, disposition in targets]
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                  text="Há ambientes com ação de ciclo de vida ao fechar",
+                                  secondary_text=("Aplicar excluirá VMs marcadas para exclusão ou restaurará o sistema no snapshot inicial. "
+                                                  "A restauração descarta mudanças no disco da VM; ambientes configurados para manter /workspace conservam esse volume. "
+                                                  "VMs em execução serão paradas. Revise a lista:\n\n" +
+                                                  "\n".join(lines)),
+                                  buttons=Gtk.ButtonsType.NONE)
+        dialog.add_button("Continuar usando", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Fechar sem aplicar", Gtk.ResponseType.CLOSE)
+        dialog.add_button("Aplicar e fechar", Gtk.ResponseType.APPLY)
+        dialog.connect("response", lambda window, response:
+                       self._close_response(window, response, targets))
+        dialog.present()
+
+    def _close_response(self, dialog: Gtk.MessageDialog, response: int,
+                        targets: list[tuple[str, str, str]]) -> None:
+        dialog.destroy()
+        if response == Gtk.ResponseType.CANCEL:
+            self._close_scan_pending = False
+        elif response == Gtk.ResponseType.CLOSE:
+            for name, _, _ in targets:
+                try: audit("disposable-retain", name, "retida", source="close-dialog")
+                except OSError: pass
+            self._allow_close = True
+            self.close()
+        elif response == Gtk.ResponseType.APPLY:
+            self._work(lambda: self._apply_close_lifecycle(targets),
+                       self._finish_disposable_close, self._close_delete_failed)
+
+    def _verify_close_target(self, name: str, disposition: str) -> None:
+        vm = next((item for item in self.service.list_vms() if item.name == name), None)
+        if vm is None or vm.lifecycle_disposition != disposition:
+            raise IncusError(f"{name}: o ciclo de vida mudou; nenhuma ação aplicada")
+        manifest = load_instance_manifest(name)
+        if (manifest.name != name or manifest.lifecycleDisposition != disposition or
+                not self.service.verify_managed_lifecycle(
+                    name, disposition, manifest.pool, manifest.workspaceSizeGiB)):
+            raise IncusError(f"{name}: propriedade ou ciclo de vida não pôde ser confirmado")
+        if disposition in {"restore-initial-on-close", "persist-workspace"} and INITIAL_SNAPSHOT not in self.service.snapshots(name):
+            raise IncusError(f"{name}: snapshot inicial ausente; nada foi restaurado")
+
+    def _apply_close_lifecycle(self, targets: list[tuple[str, str, str]]) -> tuple[list[str], list[str]]:
+        applied: list[str] = []
+        issues: list[str] = []
+        for name, _status, disposition in targets:
+            operation_ok = True
+            try:
+                self._verify_close_target(name, disposition)
+                if disposition in {"restore-initial-on-close", "persist-workspace"}:
+                    current = next(item for item in self.service.list_vms() if item.name == name)
+                    if current.status == "Running":
+                        self.service.change_state(name, "stop")
+                    self.service.restore_snapshot(name, INITIAL_SNAPSHOT)
+                elif disposition == "delete-on-close":
+                    self.service.delete(name)
+                else:
+                    raise IncusError(f"{name}: ciclo de vida ao fechar desconhecido")
+            except Exception as exc:
+                if disposition in {"restore-initial-on-close", "persist-workspace"}:
+                    issues.append(f"{name}: {exc}")
+                    break
+                try:
+                    still_exists = any(vm.name == name for vm in self.service.list_vms())
+                except Exception:
+                    still_exists = True
+                if still_exists:
+                    issues.append(f"{name}: {exc}")
+                    break
+                issues.append(f"{name}: VM removida; limpeza Incus precisa de revisão ({exc})")
+                operation_ok = False
+            applied.append(name)
+            if disposition == "delete-on-close":
+                try:
+                    remove_instance_manifest(name)
+                except OSError as exc:
+                    issues.append(f"{name}: manifesto local não removido ({exc})")
+                    operation_ok = False
+            try:
+                action = "delete" if disposition == "delete-on-close" else "snapshot-restore"
+                audit(action, name, "ok" if operation_ok else "erro", source="auto-close")
+            except OSError:
+                issues.append(f"{name}: falha ao registrar auditoria")
+        return applied, issues
+
+    def _finish_disposable_close(self, result: object) -> None:
+        applied, issues = result
+        if applied:
+            GLib.idle_add(self._toast, "Ciclo de vida aplicado: " + ", ".join(applied))
+        if issues:
+            self._close_delete_failed(RuntimeError("\n".join(issues)))
+            return
+        self._allow_close = True
+        self.close()
+
+    def _close_scan_failed(self, exc: Exception) -> None:
+        self._close_scan_pending = False
+        self._error_dialog(exc)
+
+    def _close_delete_failed(self, exc: Exception) -> None:
+        self._close_scan_pending = False
+        self._error_dialog(exc)
+
     def _audited(self, action: str, name: str, fn: Callable[[], None],
-                 done: Callable[[], None] | None = None) -> None:
+                 done: Callable[[], None] | None = None,
+                 precheck: Callable[[], None] | None = None) -> None:
         def run() -> None:
             try:
+                if precheck is not None:
+                    precheck()
+                if action in PROTECTED_ACTIONS and load_auto_snapshot():
+                    snapshot = protection_name(action)
+                    try:
+                        self.service.snapshot(name, snapshot)
+                    except Exception:
+                        try: audit("snapshot", name, "erro", source="auto")
+                        except OSError: pass
+                        raise
+                    try: audit("snapshot", name, "ok", source="auto")
+                    except OSError: pass
+                    GLib.idle_add(self._toast, f"Snapshot de proteção criado: {snapshot}")
                 fn()
             except Exception:
                 try: audit(action, name, "erro")
@@ -312,8 +578,21 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
                 GLib.idle_add(self._toast, f"Operação concluída; auditoria local falhou: {exc}")
         self._work(run, lambda *_: (done or self.show_dashboard)())
 
-    def _state(self, name: str, action: str) -> None:
-        self._audited(action, name, lambda: self.service.change_state(name, action))
+    def _state(self, name: str, action: str, copy_pending: bool = False) -> None:
+        if action == "start" and copy_pending:
+            self._audited(action, name, lambda: self.service.change_state(name, action),
+                          lambda: (self.show_dashboard(), self._apply_copies(name)))
+        else:
+            self._audited(action, name, lambda: self.service.change_state(name, action))
+
+    def _apply_copies(self, name: str) -> None:
+        status = label("Cópia única: aguardando agente Incus…", "risk")
+        page = self.details if self.stack.get_visible_child_name() == "details" else self.dashboard
+        page.append(status)
+        def progress(message: str) -> None:
+            GLib.idle_add(status.set_text, "Cópia única: " + message)
+        self._audited("copy-files", name, lambda: self.service.apply_copies(name, progress),
+                      lambda: (self._toast("Cópias únicas concluídas no disco da VM"), self.show_dashboard()))
 
     def _snapshot(self, name: str, snapshot: str) -> None:
         self._audited("snapshot", name, lambda: self.service.snapshot(name, snapshot))
@@ -324,14 +603,18 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             try:
                 original = load_instance_manifest(name)
                 data = original.to_dict(); data["name"] = target
-                save_instance_manifest(Manifest.parse(data))
+                if original.lifecycleDisposition != "persist-workspace":
+                    data.pop("lifecycle", None)
+                save_instance_manifest(Manifest.parse(data, check_copy_sources=False))
             except (ValidationError, OSError):
                 pass  # Incus clone succeeded; its effective state is still available.
         self._audited("clone", name, clone)
 
-    def _delete_prompt(self, name: str) -> None:
+    def _delete_prompt(self, name: str, workspace: bool = False) -> None:
+        consequence = (" A VM será removida e o volume separado /workspace, incluindo seus dados, também será apagado."
+                       if workspace else " Discos e snapshots serão removidos.")
         self._ask("Confirme digitando o nome da VM", "", lambda value:
-                  self._confirm("Excluir VM definitivamente?", f"VM: {name}. Discos e snapshots serão removidos.",
+                  self._confirm("Excluir VM definitivamente?", f"VM: {name}.{consequence}",
                                 lambda: self._audited("delete", name, lambda: (self.service.delete(name), remove_instance_manifest(name))))
                   if value == name else self._toast("Nome não coincide; exclusão cancelada"))
 
@@ -344,6 +627,23 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         self._confirm("Exportar manifesto salvo?", "O manifesto registra a criação original. Alterações feitas fora do IsolateVM podem não aparecer nele. Verifique Permissões efetivas antes de reutilizar.",
                       lambda: self._ask("Salvar YAML em", str(Path.home() / f"{name}.yaml"),
                                         lambda path: self._export_to(manifest, path)))
+
+    def _export_vm_versioned(self, name: str) -> None:
+        try:
+            manifest = load_instance_manifest(name)
+        except Exception as exc:
+            self._toast(f"{exc}. Consulte Permissões efetivas para inspecionar o estado Incus.")
+            return
+        self._confirm("Exportar nova versão do manifesto?",
+                      f"Será criado {name}-vNNNN.yaml em {Path.home()}. O arquivo registra a configuração original; alterações externas no Incus podem não estar nele. Nenhuma versão anterior será sobrescrita.",
+                      lambda: self._export_versioned(manifest))
+
+    def _export_versioned(self, manifest: Manifest) -> None:
+        def run() -> Path:
+            path = export_manifest_versioned(manifest, Path.home())
+            audit("export", manifest.name, "ok")
+            return path
+        self._work(run, lambda path: self._toast(f"Nova versão salva em {path}"))
 
     def _terminal(self, name: str) -> None:
         try:
@@ -387,12 +687,27 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
 
     def _backup_prompt(self, name: str, destination: str) -> None:
         target = Path(destination)
+        separate_workspace = ""
+        try:
+            if load_instance_manifest(name).lifecycleDisposition == "persist-workspace":
+                separate_workspace = " O volume persistente /workspace é separado e não entra neste backup; exporte-o pela ação própria."
+        except (OSError, ValidationError):
+            pass
         self._confirm("Exportar backup completo?",
                       f"VM: {name}\nArquivo novo: {target}\nInclui o disco e os snapshots da VM. "
-                      "Diretórios do host montados na VM não integram o backup. Para maior consistência, pare a VM antes. A exportação pode demorar e ocupar muito espaço.",
+                      "Diretórios do host montados na VM não integram o backup." + separate_workspace +
+                      " Para maior consistência, pare a VM antes. A exportação pode demorar e ocupar muito espaço.",
                       lambda: self._audited("backup-full", name,
                                             lambda: self.service.export_full(name, target),
                                             lambda: self._toast(f"Backup completo salvo em {target}")))
+
+    def _workspace_backup_prompt(self, name: str, destination: str) -> None:
+        target = Path(destination)
+        self._confirm("Exportar dados de /workspace?",
+                      f"VM: {name}\nArquivo novo: {target}\nSerá exportado o volume customizado separado. Essa exportação não é combinada ao backup da VM; pare a VM para maior consistência.",
+                      lambda: self._audited("backup-workspace", name,
+                                            lambda: self.service.export_workspace(name, target),
+                                            lambda: self._toast(f"Exportação de /workspace salva em {target}")))
 
     def _resources_dialog(self, vm: VM) -> None:
         dialog = Gtk.Dialog(title=f"Hardware · {vm.name}", transient_for=self, modal=True)
@@ -412,10 +727,9 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             new_cpu, new_memory = cpu.get_value_as_int(), memory.get_value_as_int()
             d.destroy()
             if response != Gtk.ResponseType.OK: return
-            self._confirm("Aplicar alteração de hardware?",
-                          f"CPU: {vm.cpu} → {new_cpu}\nRAM: {vm.memory} → {new_memory}MiB. A VM pode precisar reiniciar.",
-                          lambda: self._audited("resources", vm.name,
-                                                lambda: self.service.set_resources(vm.name, new_cpu, new_memory)))
+            self._review_change(vm.name, "resources",
+                                lambda effective: diff.resources(effective, new_cpu, new_memory),
+                                lambda: self.service.set_resources(vm.name, new_cpu, new_memory))
         dialog.connect("response", selected)
         dialog.present()
 
@@ -433,7 +747,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         self._clear(self.history_page)
         self.history_page.append(label("Histórico", "page-title"))
         for event in history():
-            self.history_page.append(label(f"{event['time']}  {event['vm']}  ·  {event['action']}  ·  {event['result']}"))
+            self.history_page.append(label(f"{event['time']}  {event['vm']}  ·  {event['action']}  ·  {event['result']}  ·  origem: {event.get('source', 'desconhecida')}"))
 
     def _build_settings(self) -> None:
         self.settings_page.append(label("Configurações", "page-title"))
@@ -446,6 +760,12 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             self._apply_theme(selected)
         theme.connect("changed", changed)
         self._apply_theme(load_theme())
+        self.settings_page.append(label("Proteção antes de alterações", "section-title"))
+        auto_snapshot = Gtk.Switch()
+        auto_snapshot.set_active(load_auto_snapshot())
+        self.settings_page.append(row("Criar snapshot automaticamente antes de alterar uma VM", auto_snapshot))
+        self.settings_page.append(label("Aplica-se a mounts, dispositivos, rede, CPU/RAM e restauração de snapshot. Se o snapshot falhar, a alteração não é aplicada. Ele usa o mesmo pool da VM, pode consumir espaço e não inclui arquivos do host compartilhados.", "muted"))
+        auto_snapshot.connect("notify::active", lambda widget, *_: save_auto_snapshot(widget.get_active()))
         self.settings_page.append(label("Configuração Incus global, grupos e firewall são administrados fora do aplicativo.", "muted"))
 
     @staticmethod

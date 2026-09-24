@@ -1,0 +1,77 @@
+#!/bin/sh
+set -eu
+
+want_kubectl=0
+want_helm=0
+want_terraform=0
+for tool in "$@"; do
+    case "$tool" in
+        kubectl@1.37) want_kubectl=1 ;;
+        helm@community) want_helm=1 ;;
+        terraform@hashicorp) want_terraform=1 ;;
+        *) echo "Ferramenta DevOps inválida: $tool" >&2; exit 2 ;;
+    esac
+done
+[ "$want_kubectl$want_helm$want_terraform" != "000" ] || exit 0
+
+architecture=$(dpkg --print-architecture)
+case "$architecture" in amd64|arm64) ;; *) echo "Arquitetura não suportada: $architecture" >&2; exit 1 ;; esac
+install -d -m 0755 /etc/apt/keyrings /usr/share/keyrings /etc/apt/sources.list.d
+temporary_dir=$(mktemp -d)
+trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
+
+if [ "$want_kubectl" = 1 ]; then
+    curl --fail --silent --show-error --location \
+        https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key \
+        --output "$temporary_dir/kubernetes.key"
+    gpg --batch --yes --dearmor --output /etc/apt/keyrings/isolatevm-kubernetes.gpg \
+        "$temporary_dir/kubernetes.key"
+    chmod 0644 /etc/apt/keyrings/isolatevm-kubernetes.gpg
+    printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/isolatevm-kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /' \
+        > /etc/apt/sources.list.d/isolatevm-kubernetes.list
+fi
+
+if [ "$want_helm" = 1 ]; then
+    curl --fail --silent --show-error --location \
+        https://packages.buildkite.com/helm-linux/helm-debian/gpgkey \
+        --output "$temporary_dir/helm.key"
+    helm_fingerprint=$(gpg --show-keys --with-colons "$temporary_dir/helm.key" |
+        awk -F: '$1 == "fpr" { print $10; exit }')
+    if [ "$helm_fingerprint" != "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" ]; then
+        echo "Fingerprint inesperada da chave APT comunitária do Helm" >&2
+        exit 1
+    fi
+    gpg --batch --yes --dearmor --output /usr/share/keyrings/isolatevm-helm.gpg "$temporary_dir/helm.key"
+    chmod 0644 /usr/share/keyrings/isolatevm-helm.gpg
+    printf '%s\n' 'deb [signed-by=/usr/share/keyrings/isolatevm-helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main' \
+        > /etc/apt/sources.list.d/isolatevm-helm.list
+fi
+
+if [ "$want_terraform" = 1 ]; then
+    curl --fail --silent --show-error --location \
+        https://apt.releases.hashicorp.com/gpg \
+        --output "$temporary_dir/hashicorp.key"
+    hashicorp_fingerprint=$(gpg --show-keys --with-colons "$temporary_dir/hashicorp.key" |
+        awk -F: '$1 == "fpr" { print $10; exit }')
+    if [ "$hashicorp_fingerprint" != "D55C0D1AC78A8D8126CB631CFC9CA96ACA026560" ]; then
+        echo "Fingerprint inesperada da chave APT da HashiCorp" >&2
+        exit 1
+    fi
+    gpg --batch --yes --dearmor --output /usr/share/keyrings/isolatevm-hashicorp.gpg "$temporary_dir/hashicorp.key"
+    chmod 0644 /usr/share/keyrings/isolatevm-hashicorp.gpg
+    . /etc/os-release
+    codename=${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}
+    case "$codename" in jammy|noble|resolute) ;; *) echo "Versão Ubuntu sem suporte APT HashiCorp: $codename" >&2; exit 1 ;; esac
+    printf 'deb [arch=%s signed-by=/usr/share/keyrings/isolatevm-hashicorp.gpg] https://apt.releases.hashicorp.com %s main\n' \
+        "$architecture" "$codename" > /etc/apt/sources.list.d/isolatevm-hashicorp.list
+fi
+
+packages=
+[ "$want_kubectl" = 0 ] || packages="$packages kubectl"
+[ "$want_helm" = 0 ] || packages="$packages helm"
+[ "$want_terraform" = 0 ] || packages="$packages terraform"
+# This word split contains only package names selected by the cases above.
+# shellcheck disable=SC2086
+set -- $packages
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$@"

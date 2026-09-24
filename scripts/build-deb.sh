@@ -29,6 +29,7 @@ cp "$project_dir/packaging/guest/isolatevm-inject-secrets.py" "$project_dir/pack
    "$project_dir/packaging/guest/isolatevm-copy-files.py" "$project_dir/packaging/guest/isolatevm-setup-devops" \
   "$stage_dir/usr/lib/isolatevm/guest/"
 cp "$project_dir/packaging/isolatevm-egress@.service" "$stage_dir/usr/lib/systemd/system/"
+cp "$project_dir/packaging/isolatevm-egress-firewall.service" "$stage_dir/usr/lib/systemd/system/"
 cp "$project_dir/packaging/org.isolatevm.egress.policy" "$stage_dir/usr/share/polkit-1/actions/"
 cat > "$stage_dir/DEBIAN/control" <<'EOF'
 Package: isolatevm
@@ -43,8 +44,47 @@ Suggests: virt-viewer
 Description: Local graphical manager for Incus virtual machines
  A deny-by-default desktop interface for creating and managing Incus VMs.
 EOF
+cat > "$stage_dir/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ]; then
+  active=0
+  if [ -e /var/lib/isolatevm/egress/state.json ] && ! /usr/bin/python3 - /var/lib/isolatevm/egress/state.json <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as state_file:
+        state = json.load(state_file)
+except Exception:
+    raise SystemExit(2)
+raise SystemExit(0 if isinstance(state, dict) and not state else 1)
+PY
+  then active=1
+  fi
+  if [ -e /etc/systemd/system/incus.service.d/10-isolatevm-egress.conf ] || \
+     [ -e /etc/systemd/system/snap.incus.daemon.service.d/10-isolatevm-egress.conf ]; then
+    active=1
+  fi
+  if [ "$active" -ne 0 ]; then
+    echo "Remova as VMs com rede restrita no IsolateVM antes de desinstalar; o firewall de boot protege essas VMs." >&2
+    exit 1
+  fi
+fi
+exit 0
+EOF
+cat > "$stage_dir/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = configure ] && [ -s /var/lib/isolatevm/egress/state.json ]; then
+  /usr/lib/isolatevm/isolatevm-egress-helper install-firewall-guard
+fi
+exit 0
+EOF
 find "$stage_dir" -type d -exec chmod 0755 {} +
 find "$stage_dir" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage_dir/usr/bin/isolatevm"
 chmod 0755 "$stage_dir/usr/lib/isolatevm/isolatevm-egress-helper"
+chmod 0755 "$stage_dir/DEBIAN/prerm"
+chmod 0755 "$stage_dir/DEBIAN/postinst"
 dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.8_all.deb"

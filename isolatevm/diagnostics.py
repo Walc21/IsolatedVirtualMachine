@@ -10,6 +10,22 @@ import shutil
 import subprocess
 
 from .access import local_socket
+from .storage import data_dir
+
+
+CLIENT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _incus_client_environment() -> dict[str, str]:
+    client_config_dir = data_dir() / "incus-client"
+    client_config_dir.mkdir(mode=0o700, exist_ok=True)
+    return {
+        "HOME": str(Path.home()),
+        "PATH": CLIENT_PATH,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C",
+        "INCUS_CONF": str(client_config_dir),
+    }
 
 
 def diagnose() -> list[tuple[str, str, str]]:
@@ -28,7 +44,7 @@ def diagnose() -> list[tuple[str, str, str]]:
                  "KVM", "Acessível" if kvm.exists() and os.access(kvm, os.R_OK | os.W_OK) else "Indisponível ou sem permissão"))
     rows.append(("ok" if shutil.which("qemu-system-x86_64") else "error", "QEMU",
                  shutil.which("qemu-system-x86_64") or "Não instalado"))
-    incus = shutil.which("incus")
+    incus = shutil.which("incus", path=CLIENT_PATH)
     rows.append(("ok" if incus else "error", "Incus", incus or "Não instalado"))
     viewer = shutil.which("remote-viewer") or shutil.which("spicy")
     rows.append(("ok" if viewer else "warn", "Console VGA/SPICE",
@@ -54,9 +70,7 @@ def diagnose() -> list[tuple[str, str, str]]:
     if incus and socket_mode == "confined":
         rows.append(("warn", "Serviço Incus", "Socket de usuário disponível; conexão adiada até confirmação na interface"))
     if incus and socket_mode == "admin":
-        env = os.environ.copy()
-        for key in ("INCUS_SOCKET", "INCUS_DIR", "INCUS_REMOTE", "INCUS_PROJECT"):
-            env.pop(key, None)
+        env = _incus_client_environment()
         try:
             proc = subprocess.run([incus, "--force-local", "info"], capture_output=True, text=True, timeout=8, env=env)
             rows.append(("ok" if proc.returncode == 0 else "error", "Serviço Incus",

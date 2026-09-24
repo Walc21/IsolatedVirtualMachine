@@ -442,7 +442,8 @@ def test_provisioning_status_reads_guest_without_leaking_error_details():
     result = service.provisioning_status("dev-vm")
     assert (result.status, result.stage, result.error_count) == ("degraded done", None, 2)
     assert calls == [(("exec", "dev-vm", "--", "cloud-init", "status", "--format=json"),
-                      {"timeout": 30, "ok_returncodes": (0, 1, 2)})]
+                      {"timeout": 30, "ok_returncodes": (0, 1, 2),
+                       "output_limit_bytes": 1_000_000})]
     with pytest.raises(ValidationError): service.provisioning_status("bad;name")
 
 
@@ -1209,6 +1210,28 @@ def test_integrated_terminal_uses_a_fixed_interactive_guest_shell_and_minimal_ho
     }
     with pytest.raises(ValidationError):
         service.terminal_argv("other;vm")
+
+
+def test_cli_environment_does_not_forward_session_credentials(monkeypatch, tmp_path):
+    service = LocalIncus.__new__(LocalIncus)
+    service.client_config_dir = tmp_path / "incus-client"
+    monkeypatch.setenv("OPENAI_API_KEY", "host-secret")
+    monkeypatch.setenv("INCUS_REMOTE", "untrusted-remote")
+    env = service._client_environment()
+    assert "OPENAI_API_KEY" not in env
+    assert "INCUS_REMOTE" not in env
+    assert env["INCUS_CONF"] == str(service.client_config_dir)
+
+
+def test_guest_output_capture_stops_at_the_configured_limit(tmp_path):
+    service = LocalIncus.__new__(LocalIncus)
+    service.client_config_dir = tmp_path / "incus-client"
+    service.client_config_dir.mkdir()
+    executable = tmp_path / "guest-output"
+    executable.write_text("#!/bin/sh\nprintf '0123456789ABCDEF'\n", encoding="utf-8")
+    executable.chmod(0o755)
+    with pytest.raises(IncusError, match="excedeu o limite"):
+        service._run_capped([str(executable)], timeout=2, output_limit_bytes=8)
 
 
 def test_guest_login_prompts_interactively_without_password_argument():

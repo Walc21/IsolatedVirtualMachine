@@ -44,7 +44,7 @@ def _component(name: str, include_hidden: bool) -> None:
 def source_reference(value: object, kind: str, include_hidden: bool) -> Path:
     if not isinstance(value, str) or not value.startswith("/") or ".." in Path(value).parts:
         raise CopySourceError("Cópia: origem precisa ser um caminho absoluto sem '..'")
-    if kind not in {"file", "directory"} or type(include_hidden) is not bool:
+    if not isinstance(kind, str) or kind not in {"file", "directory"} or type(include_hidden) is not bool:
         raise CopySourceError("Cópia: tipo de origem ou permissão de ocultos inválidos")
     raw = Path(value)
     home = Path.home().resolve()

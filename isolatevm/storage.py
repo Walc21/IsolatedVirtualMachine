@@ -5,11 +5,38 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 
 import yaml
 
 from .model import Manifest, ValidationError, _name
+
+
+MAX_MANIFEST_BYTES = 64_000
+
+
+def _read_manifest(path: Path) -> str:
+    """Read a regular manifest without following links or allocating without a bound."""
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValidationError("Arquivo de manifesto inválido")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_MANIFEST_BYTES:
+            raise ValidationError("Manifesto muito grande")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValidationError("Manifesto não está codificado em UTF-8") from None
+    except OSError as exc:
+        raise ValidationError("Arquivo de manifesto indisponível ou inválido") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def data_dir() -> Path:
@@ -81,8 +108,7 @@ def templates() -> list[str]:
 def load_template(name: str) -> Manifest:
     _name(name, "Template")
     path = data_dir() / "templates" / f"{name}.yaml"
-    if path.is_symlink(): raise ValidationError("Template symlink bloqueado")
-    return Manifest.from_yaml(path.read_text(encoding="utf-8"))
+    return Manifest.from_yaml(_read_manifest(path))
 
 
 def save_instance_manifest(manifest: Manifest) -> Path:
@@ -98,21 +124,26 @@ def save_instance_manifest(manifest: Manifest) -> Path:
 def load_instance_manifest(name: str) -> Manifest:
     _name(name, "VM")
     path = data_dir() / "instances" / f"{name}.yaml"
-    if path.is_symlink() or not path.is_file():
-        raise ValidationError("Não há manifesto local desta VM")
-    return Manifest.from_yaml(path.read_text(encoding="utf-8"), check_copy_sources=False)
+    try:
+        text = _read_manifest(path)
+    except ValidationError as exc:
+        raise ValidationError("Não há manifesto local válido desta VM") from exc
+    return Manifest.from_yaml(text, check_copy_sources=False)
 
 
 def saved_network_bridge(name: str) -> str | None:
     _name(name, "VM")
     path = data_dir() / "instances" / f"{name}.yaml"
-    if path.is_symlink() or not path.is_file(): return None
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(_read_manifest(path))
+        if not isinstance(data, dict):
+            return None
         network = data.get("network", {})
+        if not isinstance(network, dict):
+            return None
         bridge = network.get("bridge") if network.get("mode") in {"normal", "restricted", "lan-only"} else None
         return _name(bridge, "Bridge") if bridge else None
-    except (OSError, AttributeError, ValidationError, yaml.YAMLError):
+    except (OSError, AttributeError, TypeError, ValidationError, yaml.YAMLError):
         return None
 
 
@@ -148,9 +179,7 @@ def export_manifest_versioned(manifest: Manifest, directory: Path) -> Path:
 
 
 def import_manifest(source: Path) -> Manifest:
-    if source.is_symlink() or not source.is_file():
-        raise ValidationError("Arquivo de manifesto inválido")
-    return Manifest.from_yaml(source.read_text(encoding="utf-8"))
+    return Manifest.from_yaml(_read_manifest(source))
 
 
 def load_theme() -> str:

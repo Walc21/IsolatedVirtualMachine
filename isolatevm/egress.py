@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
-from .model import Manifest, PROXIED_NETWORK_MODES, ValidationError
+from .model import Manifest, PROXIED_NETWORK_MODES, ValidationError, _name
 
 
 HELPER = Path("/usr/lib/isolatevm/isolatevm-egress-helper")
@@ -32,6 +34,8 @@ class EgressRuntime:
 def request_for(manifest: Manifest) -> dict[str, object]:
     if manifest.networkMode not in PROXIED_NETWORK_MODES or not manifest.bridge:
         raise ValidationError("Ação de proxy exige uma rede restricted ou LAN-only válida")
+    if manifest.bridge != f"incusbr-{os.getuid()}":
+        raise ValidationError("Proxy restrito exige a bridge Incus de usuário incusbr-<UID>")
     return {"version": 1, "name": manifest.name, "bridge": manifest.bridge,
             "network_mode": manifest.networkMode,
             "rules": [{"kind": rule.kind, "value": rule.value, "port": rule.port}
@@ -42,20 +46,25 @@ def _runtime(raw: object) -> EgressRuntime:
     if not isinstance(raw, dict) or set(raw) != {"address", "gateway", "port", "mac"}:
         raise EgressError("Resposta inválida do helper de rede")
     address, gateway, port, mac = raw["address"], raw["gateway"], raw["port"], raw["mac"]
-    if (not isinstance(address, str) or not isinstance(gateway, str) or type(port) is not int or
+    try:
+        parsed_address = ipaddress.IPv4Address(address)
+        parsed_gateway = ipaddress.IPv4Address(gateway)
+    except (ipaddress.AddressValueError, TypeError):
+        raise EgressError("Resposta inválida do helper de rede") from None
+    if (str(parsed_address) != address or str(parsed_gateway) != gateway or type(port) is not int or
             not 20000 <= port <= 20254 or not isinstance(mac, str) or
-            len(mac.split(":")) != 6 or any(len(part) != 2 or any(c not in "0123456789abcdef" for c in part) for part in mac.split(":"))):
+            not re.fullmatch(r"02(?::[0-9a-f]{2}){5}", mac)):
         raise EgressError("Resposta inválida do helper de rede")
     return EgressRuntime(address, gateway, port, mac)
 
 
 def apply(manifest: Manifest) -> EgressRuntime:
-    helper = Path(os.environ.get("ISOLATEVM_EGRESS_HELPER", HELPER))
+    helper = HELPER
     if not helper.is_file() or not os.access(helper, os.X_OK):
         raise EgressError("Helper de rede restrita não está instalado")
     payload = json.dumps(request_for(manifest), separators=(",", ":"))
     try:
-        result = subprocess.run(["pkexec", str(helper), "apply"], input=payload, text=True,
+        result = subprocess.run(["/usr/bin/pkexec", str(helper), "apply"], input=payload, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EgressError("Não foi possível autorizar a política de rede restrita") from exc
@@ -69,13 +78,12 @@ def apply(manifest: Manifest) -> EgressRuntime:
 
 
 def remove(name: str) -> None:
-    if not isinstance(name, str) or not name:
-        raise ValidationError("Nome da VM inválido")
-    helper = Path(os.environ.get("ISOLATEVM_EGRESS_HELPER", HELPER))
+    name = _name(name, "VM")
+    helper = HELPER
     if not helper.is_file() or not os.access(helper, os.X_OK):
         raise EgressError("Helper de rede restrita não está instalado")
     try:
-        result = subprocess.run(["pkexec", str(helper), "remove"], input=json.dumps({"version": 1, "name": name}),
+        result = subprocess.run(["/usr/bin/pkexec", str(helper), "remove"], input=json.dumps({"version": 1, "name": name}),
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EgressError("Não foi possível remover a política de rede restrita") from exc

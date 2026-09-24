@@ -5,7 +5,7 @@ import pytest
 from isolatevm.snapshot_policy import PROTECTED_ACTIONS, protection_name
 from isolatevm.storage import (history, load_auto_snapshot, load_theme,
                                save_auto_snapshot, save_theme)
-from isolatevm.ui import IsolateWindow
+from isolatevm.ui import IsolateWindow, _local_gui_client_environment
 
 
 class RecordingService:
@@ -33,6 +33,23 @@ class WindowHarness:
 
     def _toast(self, _message: str) -> None:
         pass
+
+
+def test_external_incus_ui_environment_keeps_desktop_context_without_session_secrets(monkeypatch):
+    class Service:
+        def terminal_environment(self):
+            return {"HOME": "/home/victor", "PATH": "/usr/bin", "LANG": "C.UTF-8",
+                    "INCUS_CONF": "/home/victor/.local/share/isolatevm/incus-client"}
+
+    monkeypatch.setenv("OPENAI_API_KEY", "host-secret")
+    monkeypatch.setenv("INCUS_REMOTE", "untrusted")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/user/1000/ssh-agent.sock")
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    environment = _local_gui_client_environment(Service())
+    assert environment["DISPLAY"] == ":1"
+    assert "DBUS_SESSION_BUS_ADDRESS" in environment
+    assert not {"OPENAI_API_KEY", "INCUS_REMOTE", "SSH_AUTH_SOCK"} & environment.keys()
 
 
 def test_settings_preserve_theme_and_snapshot_preference(tmp_path, monkeypatch):

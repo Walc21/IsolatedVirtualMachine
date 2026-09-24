@@ -20,10 +20,10 @@ O smoke GTK `test_disposable_close_requires_confirmation_and_deletes_only_after_
 
 ```bash
 sudo apt install python3 python3-gi python3-yaml \
-  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 python3-pytest python3-secretstorage
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 python3-pytest python3-secretstorage squid
 ```
 
-Para os testes gráficos em um ambiente sem sessão de desktop, instale `xvfb` e execute `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`. A suíte padrão usa mocks e não precisa de daemon Incus.
+Para os testes gráficos em um ambiente sem sessão de desktop, instale `xvfb` e execute `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`. A suíte não precisa de daemon Incus. Os testes de ACL iniciam Squid localmente com `hosts_file` sintético; não conectam a uma VM ou bridge Incus.
 
 ## Executar e validar
 
@@ -45,5 +45,6 @@ Nunca execute a interface GTK como root. Testes reais de integração precisam d
 - `LocalIncus` usa arrays de argumentos em vez de strings shell e configura explicitamente os dispositivos de armazenamento e rede das VMs.
 - cloud-init instala software e helpers estáticos dentro do guest. Valores de secrets são buscados no Secret Service apenas após confirmação separada e enviados por stdin do agente Incus para tmpfs `/run`; nunca copie credenciais do host durante a criação.
 - O Incus é a fonte de verdade do estado real da VM; um manifesto salvo descreve a configuração solicitada/criada e pode divergir após edições externas.
+- Actions de terceiros no CI devem usar SHA completo e comentário de release. O workflow atual fixa `actions/checkout` em v7.0.1 e usa apenas `contents: read`.
 
 Antes de criar uma VM real, verifique o alias da imagem, pool, bridge, limites de recursos, mounts e política de egress solicitada na revisão do aplicativo. Mounts e acesso à rede devem permanecer explícitos.

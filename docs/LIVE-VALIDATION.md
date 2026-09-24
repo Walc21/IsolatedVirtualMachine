@@ -2,6 +2,18 @@
 
 This file records capabilities exercised against a locally configured Incus daemon. These observations are evidence from one test environment, not a guarantee for every Incus version, host policy, image, network, or storage backend. The automated test suite uses mocks and does not replace these live checks.
 
+## Revisão 0.3.9 — estado verificado em 2026-09-24
+
+Os fluxos Incus listados abaixo são registros de revisões anteriores. Nesta revisão, `python3 -m compileall -q isolatevm packaging/isolatevm-egress-helper.py packaging/guest` terminou sem erro. A execução completa de unidade e GTK por `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q` passou com `317 passed, 1 warning` (aviso de depreciação do PyGObject em `GLib.unix_signal_add_full`).
+
+O teste de integração usa Squid real instalado localmente com respostas DNS sintéticas: uma resposta pública passou pela ACL (a conexão posterior pode falhar por rede externa); loopback, RFC1918, link-local e mistura de IP público com loopback foram negados com HTTP 403. Reconfigurar o mesmo Squid de IP público para loopback também passou a negar a requisição, cobrindo a reavaliação da ACL sem gravar resolução no manifesto. Nesta revisão, o Squid marca conexões permitidas por regra de domínio e o helper inclui um hook nft `output` que bloqueia destinos especiais/não globais nessa marca, incluindo IPv6. O ruleset nft completo passou `--check` e foi aplicado dentro de um user/network namespace descartável; uma conexão local sem marca passou e outra com `SO_MARK=0x49564d00` foi bloqueada. Isso valida o match nft no kernel, não uma conexão de saída da Squid já marcada em execução nem o ruleset do firewall do host, que não foi alterado.
+
+O pacote `0.3.9` foi construído com `scripts/build-deb.sh`. Os metadados reportam `Package: isolatevm`, `Version: 0.3.9`, `Architecture: all`; o conteúdo e modos foram inspecionados: launcher e helper Polkit em `0755`, demais arquivos em `0644`, diretórios em `0755`. Uma extração temporária importou os módulos da versão empacotada. Instalação, upgrade, reinstall, remove e purge system-wide não foram executados: a sessão é UID 1000 e não root. Portanto, scripts Debian foram inspecionados no pacote, mas suas transições reais de `dpkg` permanecem pendentes de host descartável.
+
+Incus 6.0.5 está instalado, mas o processo atual não tem o grupo suplementar `incus`; `incus info` confirmou que o socket `/var/lib/incus/unix.socket` existe e recusou acesso por permissão. Nenhuma VM, reboot de política, cópia, secret injection, volume, snapshot, clone, inventário guest ou teste de egress via bridge foi iniciado nesta revisão. GPU/PCI/USB físicos e pinning CPU em guest também não foram testados. Os testes automatizados e a inspeção de código não substituem essas validações.
+
+Branch protection remota de `main` foi aplicada e confirmada: pull request obrigatório, check `test-and-package` exigido em modo estrito, administradores incluídos e force-push/exclusão bloqueados. A regra aceita zero aprovações de revisão; a CI ainda precisa rodar em um PR/push futuro para produzir um status check recente.
+
 The integrated VTE terminal is covered by the GTK mock flow and argv/environment unit tests. Opening a PTY to a real guest still requires a running VM and an authorized Incus connection; no live terminal session was started during this revision.
 
 ## Exercised flows
@@ -35,7 +47,7 @@ The integrated VTE terminal is covered by the GTK mock flow and argv/environment
 - The `0.2.9` `.deb` replaced installed version `0.2.8`; `/usr/bin/python3` imported version `0.2.9`. `python3-secretstorage` and `python3-jeepney` remain installed.
 - A host Docker forwarding policy can block traffic from a regular Incus bridge. The optional `packaging/isolatevm-docker-forward.*` files document a narrow operator-managed workaround; it is not installed or enabled by the IsolateVM package.
 - The restricted egress helper and Squid are separate from the GTK process. Normal networking remains unfiltered; only the restricted policy applies the tested domain/port allowlist.
-- LAN-only is new in this source revision and has only offline schema/helper tests; it has not been tried against a real private subnet or host route. Custom bridge selection enumerates managed Incus bridges and does not create or alter host networks.
+- Custom bridge selection enumerates managed Incus bridges and does not create or alter host networks. The 0.3.9 Squid ACL integration above is local-only and does not validate LAN-only routing to a real private subnet or host route.
 
 ## Not verified or out of scope
 

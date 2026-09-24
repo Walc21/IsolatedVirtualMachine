@@ -1,0 +1,9 @@
+# Minimal local setup for the IsolateVM offline integration test.
+# This preseed does not request a bridge or default device. Incus may create
+# networks on the first connection to a confined user project; inspect them.
+config: {}
+networks: []
+storage_pools:
+  - name: isolatevm
+    driver: dir
+    config: {}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Allow explicit Incus user bridge traffic through Docker forwarding policy
+After=docker.service
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/isolatevm-docker-forward
+ExecStart=/usr/local/libexec/isolatevm-docker-forward start
+ExecStop=/usr/local/libexec/isolatevm-docker-forward stop
+
+[Install]
+WantedBy=multi-user.target

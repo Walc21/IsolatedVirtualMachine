@@ -1,0 +1,16 @@
+[Unit]
+Description=IsolateVM restricted egress proxy for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=isolatevm-egress
+RuntimeDirectoryMode=0755
+ExecStartPre=/usr/sbin/squid -k parse -f /etc/isolatevm/egress/%i.conf
+ExecStart=/usr/sbin/squid --foreground -N -f /etc/isolatevm/egress/%i.conf
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

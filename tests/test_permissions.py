@@ -28,6 +28,18 @@ def test_proxy_without_nic_never_claims_offline():
     assert summary["can_block_network"] is False
 
 
+def test_usb_effective_identity_prefers_serial_then_live_address():
+    config = {"devices": {
+        "isousb0": {"type": "usb", "vendorid": "1234", "productid": "abcd", "serial": "camera-serial"},
+        "isousb1": {"type": "usb", "vendorid": "1234", "productid": "abcd", "busnum": "1", "devnum": "7"}},
+        "config": {"user.isolatevm.managed": "true"}, "profiles": []}
+    summary = describe_effective(config, config)
+    assert summary["other_devices"] == [
+        {"device": "isousb0", "type": "usb", "managed": True, "identity": "1234:abcd · serial camera-serial"},
+        {"device": "isousb1", "type": "usb", "managed": True, "identity": "1234:abcd · bus 1 device 7"},
+    ]
+
+
 def test_managed_mount_and_nic_require_marker_and_no_profiles():
     config = {"devices": {"isovm0": {"type": "disk", "source": "/home/alice/project", "path": "/workspace"},
                           "eth0": {"type": "nic", "network": "incusbr0"}},
@@ -46,3 +58,21 @@ def test_maximum_isolation_flags_external_device_drift():
               "config": {"user.isolatevm.security-profile": "maximum-isolation"}, "profiles": []}
     summary = describe_effective(config, config)
     assert any("diverge" in finding for finding in summary["warnings"])
+
+
+def test_maximum_isolation_allows_only_marked_managed_workspace_volume():
+    volume = "isolatevm-ws-0123456789abcdef01234567"
+    config = {"devices": {
+                  "root": {"type": "disk", "path": "/", "pool": "default"},
+                  "isovm-workspace": {"type": "disk", "pool": "default",
+                                      "source": volume, "path": "/workspace"}},
+              "config": {"user.isolatevm.managed": "true",
+                         "user.isolatevm.security-profile": "maximum-isolation",
+                         "user.isolatevm.lifecycle-disposition": "persist-workspace",
+                         "user.isolatevm.workspace-volume": volume}, "profiles": []}
+    summary = describe_effective(config, config)
+    assert summary["volumes"] == [{"device": "isovm-workspace", "source": volume, "path": "/workspace"}]
+    assert not any("Máximo isolamento diverge" in finding for finding in summary["warnings"])
+    config["devices"]["isovm-workspace"]["source"] = "/home/alice/project"
+    summary = describe_effective(config, config)
+    assert summary["mounts"] and any("Máximo isolamento diverge" in finding for finding in summary["warnings"])

@@ -10,6 +10,10 @@ from typing import Any
 
 import yaml
 
+from .copy_source import (CopySourceError, MAX_COPY_BYTES, MAX_COPY_FILES,
+                          canonical_source, scan_source, source_reference)
+from .software_catalog import EXTERNAL_TOOL_PACKAGES
+
 NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]{0,127}\Z")
 PIP_PACKAGE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}(?:==[a-zA-Z0-9][a-zA-Z0-9_.+!-]{0,63})?\Z")
@@ -24,6 +28,10 @@ SENSITIVE = {".ssh", ".gnupg", ".aws", ".config", ".local", ".docker", ".kube"}
 SECURITY_PROFILES = {"maximum-isolation", "normal-development", "restricted-development", "custom"}
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 ENV_VALUE = re.compile(r"[A-Za-z0-9_./:@+-]{0,256}\Z")
+SECRET_REF = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+LIFECYCLE_DISPOSITIONS = {"persistent", "manual-delete", "delete-on-close",
+                          "restore-initial-on-close", "persist-workspace"}
+INITIAL_SNAPSHOT = "isolatevm-initial"
 RESERVED_ENV = {"PATH", "HOME", "SHELL", "USER", "LOGNAME", "PWD", "IFS", "ENV", "BASH_ENV", "PYTHONPATH", "PYTHONHOME"}
 SECRET_NAME_PARTS = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "APIKEY", "PRIVATE_KEY", "ACCESS_KEY", "BEARER", "AUTH")
 
@@ -107,6 +115,49 @@ class Mount:
         return cls(host, guest.rstrip("/"), mode)
 
 
+def _copy_guest_path(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 2048 or not value.startswith("/home/ubuntu/"):
+        raise ValidationError("Cópia: destino precisa ficar dentro de /home/ubuntu")
+    parts = value.split("/")
+    try:
+        invalid = (len(parts) < 4 or parts[:3] != ["", "home", "ubuntu"] or
+                   any(not part or part in {".", ".."} or
+                       any(ord(char) < 32 or ord(char) == 127 for char in part) or
+                       len(part.encode("utf-8")) > 255 for part in parts[3:]))
+    except UnicodeEncodeError:
+        invalid = True
+    if invalid:
+        raise ValidationError("Cópia: destino inválido ou contém caminho ambíguo")
+    if parts[3].startswith(".") or parts[3] in SENSITIVE:
+        raise ValidationError("Cópia: escolha uma pasta de trabalho dentro de /home/ubuntu")
+    return value
+
+
+@dataclass(frozen=True)
+class CopySpec:
+    host: str
+    guest: str
+    kind: str
+    include_hidden: bool = False
+
+    @classmethod
+    def parse(cls, raw: Any, *, check_source: bool = True) -> "CopySpec":
+        item = _keys(raw, {"host", "guest", "kind", "includeHidden"}, "Cópia")
+        kind = item.get("kind")
+        include_hidden = item.get("includeHidden", False)
+        try:
+            host = (canonical_source(item.get("host"), kind, include_hidden)
+                    if check_source else source_reference(item.get("host"), kind, include_hidden))
+        except CopySourceError as exc:
+            raise ValidationError(str(exc)) from None
+        return cls(str(host), _copy_guest_path(item.get("guest")),
+                   kind, include_hidden)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"host": self.host, "guest": self.guest, "kind": self.kind,
+                "includeHidden": self.include_hidden}
+
+
 @dataclass(frozen=True)
 class EgressRule:
     """One explicit TCP destination admitted by the restricted proxy."""
@@ -161,10 +212,16 @@ class Manifest:
     desktop: str | None = None
     cargo: tuple[str, ...] = ()
     go: tuple[str, ...] = ()
+    secrets: tuple[str, ...] = ()
+    copies: tuple[CopySpec, ...] = ()
+    lifecycleDisposition: str = "persistent"
+    workspaceSizeGiB: int | None = None
+    pipx: tuple[str, ...] = ()
+    externalTools: tuple[str, ...] = ()
 
     @classmethod
-    def parse(cls, raw: Any) -> "Manifest":
-        item = _keys(raw, {"schemaVersion", "name", "os", "resources", "network", "mounts", "software", "metadata", "security", "environment"}, "Manifesto")
+    def parse(cls, raw: Any, *, check_copy_sources: bool = True) -> "Manifest":
+        item = _keys(raw, {"schemaVersion", "name", "os", "resources", "network", "mounts", "copies", "software", "metadata", "security", "environment", "secrets", "lifecycle"}, "Manifesto")
         if item.get("schemaVersion") != 1 or type(item.get("schemaVersion")) is not int:
             raise ValidationError("Versão de manifesto não suportada")
         os_data = _keys(item.get("os"), {"distribution", "release", "desktop"}, "Sistema")
@@ -205,6 +262,29 @@ class Manifest:
                     raise ValidationError("Destinos de mount duplicados ou sobrepostos")
                 if host == prior_host or host in prior_host.parents or prior_host in host.parents:
                     raise ValidationError("Pastas do host duplicadas ou sobrepostas")
+        copies_raw = item.get("copies", [])
+        if not isinstance(copies_raw, list) or len(copies_raw) > 16:
+            raise ValidationError("Cópia: máximo de 16 origens")
+        copies = tuple(CopySpec.parse(x, check_source=check_copy_sources) for x in copies_raw)
+        total_files = 0
+        total_bytes = 0
+        for index, copy in enumerate(copies):
+            destination = Path(copy.guest)
+            if any(destination == Path(mount.guest) or destination in Path(mount.guest).parents or
+                   Path(mount.guest) in destination.parents for mount in mounts):
+                raise ValidationError("Cópia: destino se sobrepõe a um compartilhamento permanente")
+            if any(destination == Path(earlier.guest) or destination in Path(earlier.guest).parents or
+                   Path(earlier.guest) in destination.parents for earlier in copies[:index]):
+                raise ValidationError("Cópia: destinos duplicados ou sobrepostos")
+            if check_copy_sources:
+                try:
+                    entries = scan_source(copy.host, copy.kind, copy.include_hidden)
+                except CopySourceError as exc:
+                    raise ValidationError(str(exc)) from None
+                total_files += sum(not entry.directory for entry in entries)
+                total_bytes += sum(entry.size for entry in entries)
+                if total_files > MAX_COPY_FILES or total_bytes > MAX_COPY_BYTES:
+                    raise ValidationError("Cópia: limite total de 2048 arquivos ou 1 GiB excedido")
         security = _keys(item.get("security", {"profile": "custom"}), {"profile"}, "Segurança")
         profile = security.get("profile")
         if not isinstance(profile, str) or profile not in SECURITY_PROFILES:
@@ -215,6 +295,30 @@ class Manifest:
             raise ValidationError("Rede restrita exige o perfil restricted-development")
         if profile == "maximum-isolation" and (mode != "offline" or mounts):
             raise ValidationError("Máximo isolamento exige rede offline e nenhum compartilhamento do host")
+        if profile == "maximum-isolation" and copies:
+            raise ValidationError("Máximo isolamento impede copiar arquivos do host para a VM")
+        secrets_raw = item.get("secrets", [])
+        if (not isinstance(secrets_raw, list) or len(secrets_raw) > 32 or
+                any(not isinstance(name, str) or not SECRET_REF.fullmatch(name) or name in RESERVED_ENV or
+                    name.startswith("LD_") for name in secrets_raw)):
+            raise ValidationError("Secrets: use até 32 nomes de variável válidos; valores não podem constar no manifesto")
+        secrets = tuple(dict.fromkeys(secrets_raw))
+        if profile == "maximum-isolation" and secrets:
+            raise ValidationError("Máximo isolamento impede disponibilizar secrets ao guest")
+        lifecycle = _keys(item.get("lifecycle", {}), {"disposition", "workspaceSizeGiB"}, "Ciclo de vida")
+        disposition = lifecycle.get("disposition", "persistent")
+        if not isinstance(disposition, str) or disposition not in LIFECYCLE_DISPOSITIONS:
+            raise ValidationError("Ciclo de vida: escolha persistent, manual-delete, delete-on-close, restore-initial-on-close ou persist-workspace")
+        workspace_size = None
+        if disposition == "persist-workspace":
+            workspace_size = _integer(lifecycle.get("workspaceSizeGiB", 20), 1, 2048,
+                                      "Tamanho persistente de /workspace")
+            workspace_path = Path("/workspace")
+            if any(Path(mount.guest) == workspace_path or Path(mount.guest) in workspace_path.parents or
+                   workspace_path in Path(mount.guest).parents for mount in mounts):
+                raise ValidationError("Persistir /workspace exige um volume Incus próprio; remova mounts host sobrepostos")
+        elif "workspaceSizeGiB" in lifecycle:
+            raise ValidationError("workspaceSizeGiB só pode ser definido com persist-workspace")
         environment = item.get("environment", {})
         if not isinstance(environment, dict) or len(environment) > 32:
             raise ValidationError("Variáveis de ambiente: máximo de 32 pares NOME=VALOR")
@@ -227,13 +331,20 @@ class Manifest:
                 raise ValidationError("Valor de variável de ambiente inválido; use texto simples sem espaços ou caracteres de shell")
             if value.startswith(("sk-", "ghp_", "github_pat_", "xoxb-", "AKIA")):
                 raise ValidationError("Valor parece ser uma credencial; não coloque secrets no manifesto")
-        software = _keys(item.get("software", {"apt": []}), {"apt", "pip", "npm", "cargo", "go"}, "Software")
+        software = _keys(item.get("software", {"apt": []}), {"apt", "pip", "pipx", "npm", "cargo", "go", "external"}, "Software")
         packages = software.get("apt", [])
         if not isinstance(packages, list) or len(packages) > 100 or any(not isinstance(p, str) or not PACKAGE.fullmatch(p) for p in packages):
             raise ValidationError("Lista APT inválida")
         pip = software.get("pip", [])
         if not isinstance(pip, list) or len(pip) > 50 or any(not isinstance(p, str) or not PIP_PACKAGE.fullmatch(p) for p in pip):
             raise ValidationError("Lista Python inválida")
+        pipx = software.get("pipx", [])
+        if not isinstance(pipx, list) or len(pipx) > 50 or any(not isinstance(p, str) or not PIP_PACKAGE.fullmatch(p) for p in pipx):
+            raise ValidationError("Lista pipx inválida; use pacote ou pacote==versão exata")
+        external = software.get("external", [])
+        if not isinstance(external, list) or len(external) > 16 or any(
+                not isinstance(tool, str) or tool not in EXTERNAL_TOOL_PACKAGES for tool in external):
+            raise ValidationError("Lista de ferramentas DevOps externas inválida")
         npm = software.get("npm", [])
         if not isinstance(npm, list) or len(npm) > 50 or any(not isinstance(p, str) or not NPM_PACKAGE.fullmatch(p) for p in npm):
             raise ValidationError("Lista npm inválida")
@@ -243,6 +354,12 @@ class Manifest:
         go = software.get("go", [])
         if not isinstance(go, list) or len(go) > 32 or any(not isinstance(p, str) or not GO_PACKAGE.fullmatch(p) or ".." in p for p in go):
             raise ValidationError("Lista Go inválida; use módulo/comando@vX.Y.Z")
+        if "rustup" in packages and {"rustc", "cargo"}.issubset(packages):
+            raise ValidationError("Escolha rustup ou o toolchain Rust dos repositórios Ubuntu, não ambos")
+        if "dotnet-sdk-8.0" in packages and os_data["release"] == "26.04":
+            raise ValidationError(".NET 8.0 não está na feed Ubuntu padrão de 26.04; configure uma fonte compatível explicitamente")
+        if "dotnet-sdk-10.0" in packages and os_data["release"] == "22.04":
+            raise ValidationError(".NET 10.0 não está na feed Ubuntu padrão de 22.04; configure uma fonte compatível explicitamente")
         metadata = _keys(item.get("metadata", {}), {"template"}, "Metadados")
         template = metadata.get("template")
         if template is not None:
@@ -255,10 +372,17 @@ class Manifest:
                    mounts, tuple(dict.fromkeys(packages)), tuple(dict.fromkeys(pip)),
                    tuple(dict.fromkeys(npm)), template, profile,
                    tuple(sorted(environment.items())), desktop,
-                   tuple(dict.fromkeys(cargo)), tuple(dict.fromkeys(go)))
+                   tuple(dict.fromkeys(cargo)), tuple(dict.fromkeys(go)), secrets, copies, disposition,
+                   workspace_size, tuple(dict.fromkeys(pipx)), tuple(dict.fromkeys(external)))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schemaVersion": 1, "name": self.name,
+        software = {"apt": list(self.apt), "pip": list(self.pip), "npm": list(self.npm),
+                    "cargo": list(self.cargo), "go": list(self.go)}
+        if self.pipx:
+            software["pipx"] = list(self.pipx)
+        if self.externalTools:
+            software["external"] = list(self.externalTools)
+        result = {"schemaVersion": 1, "name": self.name,
                 "os": {"distribution": "ubuntu", "release": self.release,
                        **({"desktop": self.desktop} if self.desktop else {})},
                 "resources": {"cpu": self.cpu, "memoryMiB": self.memoryMiB,
@@ -269,19 +393,29 @@ class Manifest:
                 "mounts": [asdict(x) for x in self.mounts],
                 "security": {"profile": self.securityProfile},
                 "environment": dict(self.environment),
-                "software": {"apt": list(self.apt), "pip": list(self.pip), "npm": list(self.npm),
-                             "cargo": list(self.cargo), "go": list(self.go)},
+                "software": software,
                 "metadata": {"template": self.template} if self.template else {}}
+        if self.secrets:
+            result["secrets"] = list(self.secrets)
+        if self.copies:
+            result["copies"] = [copy.to_dict() for copy in self.copies]
+        if self.lifecycleDisposition != "persistent":
+            lifecycle = {"disposition": self.lifecycleDisposition}
+            if self.lifecycleDisposition == "persist-workspace":
+                lifecycle["workspaceSizeGiB"] = self.workspaceSizeGiB
+            result["lifecycle"] = lifecycle
+        return result
 
     def to_yaml(self) -> str:
         return yaml.safe_dump(self.to_dict(), allow_unicode=True, sort_keys=False)
 
     @classmethod
-    def from_yaml(cls, text: str) -> "Manifest":
+    def from_yaml(cls, text: str, *, check_copy_sources: bool = True) -> "Manifest":
         if len(text) > 64_000:
             raise ValidationError("Manifesto muito grande")
         try:
-            return cls.parse(yaml.load(text, Loader=_ManifestLoader))
+            return cls.parse(yaml.load(text, Loader=_ManifestLoader),
+                             check_copy_sources=check_copy_sources)
         except yaml.YAMLError as exc:
             raise ValidationError("YAML inválido") from exc
 
@@ -292,15 +426,26 @@ class Manifest:
                  f"CPU: {self.cpu} · RAM: {self.memoryMiB} MiB · Disco: {self.diskGiB} GiB ({self.pool})",
                  f"Rede: {self.networkMode}" + (f" via {self.bridge}" if self.bridge else ""),
                  f"Perfil de segurança: {self.securityProfile}",
+                 f"Ciclo de vida: {self.lifecycleDisposition}",
+                 *( [f"Volume persistente: /workspace · {self.workspaceSizeGiB} GiB" ]
+                    if self.lifecycleDisposition == "persist-workspace" else [] ),
                  f"Pacotes APT: {', '.join(self.apt) if self.apt else 'nenhum'}",
                  f"Pacotes Python: {', '.join(self.pip) if self.pip else 'nenhum'}",
+                 f"Aplicativos Python pipx: {', '.join(self.pipx) if self.pipx else 'nenhum'}",
                  f"Pacotes npm globais: {', '.join(self.npm) if self.npm else 'nenhum'}",
                  f"Crates Cargo: {', '.join(self.cargo) if self.cargo else 'nenhum'}",
                  f"Ferramentas Go: {', '.join(self.go) if self.go else 'nenhum'}",
+                 f"Ferramentas DevOps externas: {', '.join(self.externalTools) if self.externalTools else 'nenhuma'}",
+                 *( ["APT externo do guest: canal kubectl 1.37, Helm comunitário Buildkite e/ou Terraform HashiCorp; pacote efetivo acompanha o feed selecionado." ]
+                    if self.externalTools else [] ),
                  "Saída restrita: " + (", ".join(f"{rule.value}:{rule.port}" for rule in self.egress) if self.egress else "não aplicável"),
                  f"Variáveis não secretas: {', '.join(key for key, _ in self.environment) if self.environment else 'nenhuma'}",
-                 f"Diretórios do host: {len(self.mounts)}"]
+                 f"Secrets referenciados: {', '.join(self.secrets) if self.secrets else 'nenhum'} (valores fora do manifesto)",
+                 f"Diretórios do host: {len(self.mounts)}",
+                 f"Cópias únicas para o disco da VM: {len(self.copies)}"]
         lines.extend(f"  {x.host} → {x.guest} [{x.mode.upper()}]" for x in self.mounts)
+        lines.extend(f"  COPIAR {x.host} → {x.guest} ({'pasta' if x.kind == 'directory' else 'arquivo'})"
+                     for x in self.copies)
         lines.append("Alterações no host: nenhuma configuração global; Incus armazenará VM/disco.")
         lines.append("Download: imagem e pacotes, se ausentes. Tamanho depende do servidor remoto.")
         return lines

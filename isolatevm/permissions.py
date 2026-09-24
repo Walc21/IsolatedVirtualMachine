@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .workspace_volume import WORKSPACE_DEVICE
+
 
 NETWORK_SAFE_DEVICE_TYPES = {"disk", "nic", "tpm", "none"}
 
@@ -25,6 +27,7 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
     other_devices: list[dict[str, str]] = []
     possible_network_devices: list[str] = []
     warnings: list[str] = []
+    managed_workspace_volume = False
 
     for name, raw in devices.items():
         if not isinstance(name, str) or not isinstance(raw, dict):
@@ -44,12 +47,28 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
                     warnings.append(f"Mount amplo ou sensível detectado: {source}.")
             else:
                 volumes.append({"device": name, "source": source or "não informado", "path": path or "?"})
+                managed_workspace_volume = managed_workspace_volume or (
+                    name == WORKSPACE_DEVICE and managed_instance and name in local_devices and
+                    local_settings.get("user.isolatevm.lifecycle-disposition") == "persist-workspace" and
+                    local_settings.get("user.isolatevm.workspace-volume") == source and
+                    source and not Path(source).is_absolute() and path == "/workspace" and
+                    raw.get("pool") == _mapping(local_devices.get(name)).get("pool"))
         elif kind == "nic":
             nics.append({"device": name, "network": str(raw.get("network") or raw.get("parent") or "não informada"),
                          "nictype": str(raw.get("nictype") or "não informado")})
         else:
-            other_devices.append({"device": name, "type": kind,
-                                  "managed": managed_instance and ((kind == "usb" and name.startswith("isousb") and name[6:].isdigit()) or (kind == "gpu" and name.startswith("isogpu") and name[6:].isdigit())) and name in local_devices})
+            other = {"device": name, "type": kind,
+                     "managed": managed_instance and ((kind == "usb" and name.startswith("isousb") and name[6:].isdigit()) or (kind == "gpu" and name.startswith("isogpu") and name[6:].isdigit())) and name in local_devices}
+            if kind == "usb":
+                identity = f"{raw.get('vendorid', '?')}:{raw.get('productid', '?')}"
+                if raw.get("serial"):
+                    identity += f" · serial {raw['serial']}"
+                elif raw.get("busnum") is not None and raw.get("devnum") is not None:
+                    identity += f" · bus {raw['busnum']} device {raw['devnum']}"
+                other["identity"] = identity
+            elif kind == "gpu":
+                other["identity"] = str(raw.get("pci", "PCI desconhecido"))
+            other_devices.append(other)
             if kind not in NETWORK_SAFE_DEVICE_TYPES:
                 possible_network_devices.append(f"{name} ({kind})")
 
@@ -63,7 +82,9 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
         network = "Sem NIC ou proxy Incus detectado; verifique mounts e configuração externa"
     if possible_network_devices:
         warnings.append("Proxy, passthrough ou dispositivo não classificado pode criar acesso de rede fora de uma NIC Incus.")
-    if security_profile == "maximum-isolation" and (mounts or volumes or nics or any(x["type"] not in {"tpm", "none"} for x in other_devices)):
+    unexpected_volumes = [item for item in volumes
+                          if not (managed_workspace_volume and item["device"] == WORKSPACE_DEVICE)]
+    if security_profile == "maximum-isolation" and (mounts or unexpected_volumes or nics or any(x["type"] not in {"tpm", "none"} for x in other_devices)):
         warnings.append("Perfil Máximo isolamento diverge dos dispositivos efetivos; revise alterações externas.")
     expanded_settings = _mapping(config.get("config"))
     weak_keys = [key for key in expanded_settings if isinstance(key, str) and

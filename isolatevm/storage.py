@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import tempfile
 
 import yaml
 
@@ -20,7 +21,7 @@ def data_dir() -> Path:
 
 
 def audit(action: str, vm: str, result: str, source: str = "gui") -> None:
-    if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "network-block", "network-restore", "resources", "clone", "template", "export", "backup-full"}:
+    if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "network-block", "network-restore", "resources", "clone", "template", "export", "backup-full", "backup-workspace", "secret-store", "secret-delete", "secret-inject", "secret-clear", "copy-files", "disposable-retain"}:
         raise ValidationError("Ação de auditoria desconhecida")
     event = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "action": action, "vm": vm, "result": result, "source": source}
@@ -45,12 +46,30 @@ def save_template(name: str, manifest: Manifest) -> Path:
     data = manifest.to_dict()
     data["name"] = name
     data["mounts"] = []
+    data.pop("copies", None)
     data["metadata"] = {"template": name}
     clean = Manifest.parse(data)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise ValidationError("Template já existe; escolha outro nome ou salve uma nova versão") from None
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(clean.to_yaml())
     return path
+
+
+def save_template_versioned(name: str, manifest: Manifest) -> Path:
+    _name(name, "Template")
+    base = name[:56].rstrip("-")
+    for number in range(1, 10_000):
+        versioned = f"{base}-v{number:04d}"
+        try:
+            return save_template(versioned, manifest)
+        except ValidationError:
+            path = data_dir() / "templates" / f"{versioned}.yaml"
+            if not path.exists() and not path.is_symlink():
+                raise
+    raise ValidationError("Limite de versões do template atingido")
 
 
 def templates() -> list[str]:
@@ -81,7 +100,7 @@ def load_instance_manifest(name: str) -> Manifest:
     path = data_dir() / "instances" / f"{name}.yaml"
     if path.is_symlink() or not path.is_file():
         raise ValidationError("Não há manifesto local desta VM")
-    return Manifest.from_yaml(path.read_text(encoding="utf-8"))
+    return Manifest.from_yaml(path.read_text(encoding="utf-8"), check_copy_sources=False)
 
 
 def saved_network_bridge(name: str) -> str | None:
@@ -106,9 +125,26 @@ def export_manifest(manifest: Manifest, destination: Path) -> None:
     # An export contains authorized paths, but never credential values.
     if destination.suffix.lower() not in {".yaml", ".yml"}:
         raise ValidationError("Use extensão .yaml ou .yml")
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise ValidationError("Arquivo já existe; escolha outro nome ou use Exportar versão") from None
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(manifest.to_yaml())
+
+
+def export_manifest_versioned(manifest: Manifest, directory: Path) -> Path:
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValidationError("Escolha uma pasta existente para exportar versões")
+    for number in range(1, 10_000):
+        destination = directory / f"{manifest.name}-v{number:04d}.yaml"
+        try:
+            export_manifest(manifest, destination)
+            return destination
+        except ValidationError as exc:
+            if not destination.exists() and not destination.is_symlink():
+                raise
+    raise ValidationError("Limite de versões do manifesto atingido")
 
 
 def import_manifest(source: Path) -> Manifest:
@@ -118,22 +154,58 @@ def import_manifest(source: Path) -> Manifest:
 
 
 def load_theme() -> str:
+    value = _read_settings().get("theme")
+    return value if value in {"system", "light", "dark"} else "system"
+
+
+def _read_settings() -> dict:
     path = data_dir() / "settings.json"
-    if not path.is_file() or path.is_symlink(): return "system"
+    if not path.is_file() or path.is_symlink(): return {}
     try:
-        value = json.loads(path.read_text(encoding="utf-8")).get("theme")
-        return value if value in {"system", "light", "dark"} else "system"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError, AttributeError):
-        return "system"
+        return {}
+
+
+def _write_settings(value: dict) -> None:
+    folder = data_dir()
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="settings-",
+                                         suffix=".json", dir=folder, delete=False) as stream:
+            name = stream.name
+            json.dump(value, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, folder / "settings.json")
+        name = None
+        directory_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+    finally:
+        if name is not None:
+            Path(name).unlink(missing_ok=True)
 
 
 def save_theme(theme: str) -> None:
     if theme not in {"system", "light", "dark"}:
         raise ValidationError("Tema inválido")
-    path = data_dir() / "settings.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump({"theme": theme}, stream)
+    value = _read_settings()
+    value["theme"] = theme
+    _write_settings(value)
+
+
+def load_auto_snapshot() -> bool:
+    return _read_settings().get("autoSnapshotBeforeChange") is True
+
+
+def save_auto_snapshot(enabled: bool) -> None:
+    if type(enabled) is not bool:
+        raise ValidationError("Preferência de snapshot inválida")
+    value = _read_settings()
+    value["autoSnapshotBeforeChange"] = enabled
+    _write_settings(value)
 
 
 def first_run() -> bool:

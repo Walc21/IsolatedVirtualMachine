@@ -15,6 +15,9 @@ class UsbDevice:
     vendor_id: str
     product_id: str
     description: str
+    busnum: int | None = None
+    devnum: int | None = None
+    serial: str = ""
 
 
 def _read(path: Path) -> str:
@@ -37,7 +40,17 @@ def host_usb_devices(root: Path = Path("/sys/bus/usb/devices")) -> list[UsbDevic
         vendor, product = _read(item / "idVendor").lower(), _read(item / "idProduct").lower()
         if not HEX_ID.fullmatch(vendor) or not HEX_ID.fullmatch(product):
             continue
+        try:
+            busnum = int(_read(item / "busnum"), 10)
+            devnum = int(_read(item / "devnum"), 10)
+        except ValueError:
+            continue
+        if not 1 <= busnum <= 255 or not 1 <= devnum <= 127:
+            continue
         words = [_read(item / "manufacturer"), _read(item / "product")]
         description = " ".join(word for word in words if word) or "Dispositivo USB sem descrição"
-        result.append(UsbDevice(item.name, vendor, product, description))
+        serial = _read(item / "serial")
+        if len(serial) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in serial):
+            serial = ""
+        result.append(UsbDevice(item.name, vendor, product, description, busnum, devnum, serial))
     return result

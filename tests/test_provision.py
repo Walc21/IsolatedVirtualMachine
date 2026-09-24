@@ -31,6 +31,16 @@ def test_no_packages_means_no_cloud_init():
     assert cloud_config(manifest({"apt": [], "pip": [], "npm": []})) is None
 
 
+def test_persistent_workspace_cloud_init_sets_guest_user_ownership():
+    raw = manifest({"apt": [], "pip": [], "npm": []}).to_dict()
+    raw["lifecycle"] = {"disposition": "persist-workspace", "workspaceSizeGiB": 12}
+    data = yaml.safe_load(cloud_config(Manifest.parse(raw))[len("#cloud-config\n"):])
+    assert data["runcmd"] == [
+        ["/usr/bin/chown", "1000:1000", "/workspace"],
+        ["/usr/bin/chmod", "0750", "/workspace"],
+    ]
+
+
 def test_restricted_proxy_is_written_for_apt_and_interactive_tools():
     config = cloud_config(manifest({"apt": []}), "http://198.51.100.1:20200")
     data = yaml.safe_load(config[len("#cloud-config\n"):])
@@ -61,6 +71,23 @@ def test_non_secret_environment_uses_structured_cloud_init_file():
     assert "runcmd" not in data
 
 
+def test_secret_references_install_only_helpers_never_values_in_cloud_init():
+    raw = manifest({"apt": []}).to_dict()
+    raw["security"] = {"profile": "normal-development"}
+    raw["secrets"] = ["OPENAI_API_KEY"]
+    config = cloud_config(Manifest.parse(raw))
+    data = yaml.safe_load(config[len("#cloud-config\n"):])
+    files = {item["path"]: item for item in data["write_files"]}
+    injector = files["/usr/local/lib/isolatevm/inject-secrets"]
+    runner = files["/usr/local/bin/isolatevm-run"]
+    assert injector["permissions"] == "0750"
+    assert runner["permissions"] == "0755"
+    assert "OPENAI_API_KEY" not in injector["content"]
+    assert "OPENAI_API_KEY" not in runner["content"]
+    assert "synthetic-secret-value" not in config
+    assert "packages" not in data
+
+
 def test_codex_cli_is_guest_package_without_secret():
     m = manifest({"apt": [], "pip": [], "npm": ["@openai/codex@latest"]})
     config = cloud_config(m)
@@ -80,6 +107,43 @@ def test_pinned_cargo_and_go_tools_use_structured_guest_commands():
         ["/usr/local/lib/isolatevm/go-install", "golang.org/x/tools/gopls@v0.20.0"]]
     assert data["write_files"] == [{"path": "/usr/local/lib/isolatevm/go-install",
         "content": GO_INSTALL_RETRY, "owner": "root:root", "permissions": "0755"}]
+
+
+def test_python_cli_tools_use_pipx_as_the_guest_user_and_pinned_versions():
+    m = manifest({"apt": [], "pipx": ["uv==0.12.18", "poetry==2.5.1"]})
+    data = yaml.safe_load(cloud_config(m)[len("#cloud-config\n"):])
+    assert data["packages"] == ["pipx", "python3-venv"]
+    assert data["runcmd"] == [
+        ["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install", "uv==0.12.18"],
+        ["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install", "poetry==2.5.1"],
+    ]
+    path_file = next(item for item in data["write_files"]
+                     if item["path"] == "/etc/profile.d/isolatevm-pipx.sh")
+    assert "/home/ubuntu/.local/bin" in path_file["content"]
+    assert path_file["owner"] == "root:root" and path_file["permissions"] == "0644"
+
+
+def test_rustup_installs_stable_toolchain_as_guest_user():
+    m = manifest({"apt": ["rustup"]})
+    data = yaml.safe_load(cloud_config(m)[len("#cloud-config\n"):])
+    assert data["packages"] == ["rustup"]
+    assert data["runcmd"] == [["/usr/sbin/runuser", "--user", "ubuntu", "--",
+                               "rustup", "default", "stable"]]
+
+
+def test_devops_tools_use_whitelisted_signed_repositories_inside_guest():
+    tools = ["kubectl@1.37", "helm@community", "terraform@hashicorp"]
+    m = manifest({"apt": [], "external": tools})
+    data = yaml.safe_load(cloud_config(m)[len("#cloud-config\n"):])
+    assert data["packages"] == ["ca-certificates", "curl", "gnupg"]
+    assert data["runcmd"] == [["/usr/local/lib/isolatevm/setup-devops-packages", *tools]]
+    helper = next(item for item in data["write_files"]
+                  if item["path"] == "/usr/local/lib/isolatevm/setup-devops-packages")
+    assert helper["owner"] == "root:root" and helper["permissions"] == "0750"
+    assert "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6" in helper["content"]
+    assert "D55C0D1AC78A8D8126CB631CFC9CA96ACA026560" in helper["content"]
+    assert "stable:/v1.37/deb" in helper["content"]
+    assert "eval " not in helper["content"]
 
 
 @pytest.mark.parametrize("software", [

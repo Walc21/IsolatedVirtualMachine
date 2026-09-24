@@ -35,6 +35,22 @@ INCUS_SERVICE_UNITS = ("incus.service", "snap.incus.daemon.service")
 FIREWALL_DROPIN = "[Unit]\nRequires=isolatevm-egress-firewall.service\nAfter=isolatevm-egress-firewall.service\n"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 8 * 1024 * 1024
+MAX_COMMAND_INPUT_BYTES = MAX_STATE_BYTES
+MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
+DOMAIN_EGRESS_MARK = "0x49564d00"  # Reserved by IsolateVM for domain-allowlist sockets.
+
+# Based on the IANA IPv4 Special-Purpose Address Registry, plus IPv4
+# multicast. Domain rules are IPv4-only: the generated Squid policy rejects a
+# hostname if any IPv6 answer exists. This avoids family-conversion ambiguity
+# in Squid's dst ACL and keeps the host-side destination policy auditable.
+# Review this list when IANA's registry changes.
+NON_GLOBAL_DESTINATIONS = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+    "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+    "224.0.0.0/4", "240.0.0.0/4",
+)
 
 
 class Error(ValueError):
@@ -42,17 +58,25 @@ class Error(ValueError):
 
 
 def run(*args: str, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, input=input_text, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=45, check=False)
+    result = run_limited(list(args), input_text=input_text,
+                         output_limit_bytes=MAX_COMMAND_OUTPUT_BYTES, timeout=45)
     if check and result.returncode:
-        raise Error(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"falhou: {args[0]}")
+        detail = result.stderr.strip().splitlines()[-1:] or [f"falhou: {args[0]}"]
+        raise Error(detail[0][-600:])
     return result
 
 
 def run_limited(args: list[str], *, output_limit_bytes: int,
-                timeout: int = 45) -> subprocess.CompletedProcess[str]:
-    """Capture bounded output from local inventory commands such as Incus leases."""
-    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                timeout: int = 45,
+                input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    """Run fixed argv with bounded stdin, stdout, stderr, and time."""
+    if type(output_limit_bytes) is not int or output_limit_bytes < 1:
+        raise ValueError("output_limit_bytes precisa ser positivo")
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
+    if input_bytes is not None and len(input_bytes) > MAX_COMMAND_INPUT_BYTES:
+        raise Error("entrada do comando excedeu o limite permitido")
+    process = subprocess.Popen(args, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=False, bufsize=0)
     stdout = bytearray()
     stderr = bytearray()
@@ -71,6 +95,12 @@ def run_limited(args: list[str], *, output_limit_bytes: int,
             if stream is not None:
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, target)
+        if process.stdin is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            if input_bytes:
+                selector.register(process.stdin, selectors.EVENT_WRITE, [input_bytes, 0])
+            else:
+                process.stdin.close()
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -81,6 +111,21 @@ def run_limited(args: list[str], *, output_limit_bytes: int,
                 stop_process()
                 raise Error("consulta local excedeu o tempo permitido")
             for key, _ in events:
+                if key.fileobj is process.stdin:
+                    payload, offset = key.data
+                    try:
+                        written = os.write(key.fileobj.fileno(), payload[offset:offset + 65536])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        written = len(payload) - offset
+                    offset += written
+                    if offset >= len(payload):
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                    else:
+                        key.data[1] = offset
+                    continue
                 remaining_output = output_limit_bytes + 1 - len(stdout) - len(stderr)
                 chunk = os.read(key.fileobj.fileno(), min(65536, remaining_output))
                 if not chunk:
@@ -103,6 +148,8 @@ def run_limited(args: list[str], *, output_limit_bytes: int,
             process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
     return subprocess.CompletedProcess(args, returncode, stdout.decode("utf-8", "replace"),
                                         stderr.decode("utf-8", "replace"))
 
@@ -230,10 +277,18 @@ def state() -> dict[str, dict[str, object]]:
             raw = stream.read(MAX_STATE_BYTES + 1)
         if len(raw) > MAX_STATE_BYTES:
             raise Error("estado de rede excede o limite; intervenção administrativa necessária")
-        data = json.loads(raw.decode("utf-8"))
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise Error("estado de rede contém campos duplicados; intervenção administrativa necessária")
+                result[key] = value
+            return result
+
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise Error("estado de rede inválido; intervenção administrativa necessária") from exc
     finally:
         if fd >= 0:
@@ -388,11 +443,26 @@ def mac_for(uid: int, name_value: str) -> str:
 
 def squid_config(name_value: str, address: str, gateway: str, port: int, allow: list[dict[str, object]]) -> str:
     lines = [f"http_port {gateway}:{port}", f"acl vm_source src {address}"]
+    if any(rule["kind"] == "domain" for rule in allow):
+        # dst performs the lookup at request time. Requiring an IPv4 address
+        # makes failed resolution deny by default; rejecting any IPv6 answer
+        # avoids cross-family ACL ambiguity. dst checks every resolved IPv4
+        # candidate, so one non-global answer rejects a mixed result/rebinding.
+        lines += ["acl destination_has_ipv4_address dst ipv4",
+                  "acl destination_has_ipv6_address dst ipv6",
+                  "acl non_global_destination dst " + " ".join(NON_GLOBAL_DESTINATIONS)]
     for index, rule in enumerate(allow):
         kind, value, destination_port = rule["kind"], rule["value"], rule["port"]
-        directive = "dstdomain" if kind == "domain" else "dst"
-        lines += [f"acl destination_{index} {directive} {value}", f"acl destination_port_{index} port {destination_port}",
-                  f"http_access allow vm_source destination_{index} destination_port_{index}"]
+        directive = "dstdomain -n" if kind == "domain" else "dst"
+        lines += [f"acl destination_{index} {directive} {value}", f"acl destination_port_{index} port {destination_port}"]
+        if kind == "domain":
+            # dstdomain is a fast ACL. Marking the request lets nftables
+            # enforce the address policy on the actual host-side packet even
+            # if Squid's DNS cache expires between ACL evaluation and connect.
+            lines.append(f"tcp_outgoing_mark {DOMAIN_EGRESS_MARK} vm_source destination_{index}")
+        address_guard = (" destination_has_ipv4_address !destination_has_ipv6_address"
+                         " !non_global_destination" if kind == "domain" else "")
+        lines.append(f"http_access allow vm_source destination_{index} destination_port_{index}{address_guard}")
     lines += ["http_access deny vm_source", "http_access deny all", "cache deny all", "cache_effective_user proxy",
               f"cache_log stdio:{LOG / (name_value + '.cache.log')}",
               f"access_log stdio:{LOG / (name_value + '.access.log')}", "pid_filename none", "coredump_dir /tmp",
@@ -472,20 +542,39 @@ def render_nft(data: dict[str, dict[str, object]]) -> str:
                   f"    ether saddr {mac} ip saddr {address} ip daddr {gateway} tcp dport {port} accept",
                   f"    ether saddr {mac} drop"]
     lines += ["  }", "}"]
+    if any(isinstance(record.get("rules"), list) and
+           any(isinstance(rule, dict) and rule.get("kind") == "domain"
+               for rule in record["rules"])
+           for record in data.values()):
+        # Squid's DNS selection and ACL evaluation share a cache, but an
+        # expired entry may be resolved again before the socket is opened.
+        # Filter marked domain traffic at the actual OUTPUT destination.
+        lines += ["", "table inet isolatevm_domain_egress {",
+                  "  chain output {", "    type filter hook output priority filter; policy accept;"]
+        for network in NON_GLOBAL_DESTINATIONS:
+            lines.append(f"    meta mark {DOMAIN_EGRESS_MARK} ip daddr {network} drop")
+        lines += [f"    meta mark {DOMAIN_EGRESS_MARK} ip6 daddr ::/0 drop", "  }", "}"]
     return "\n".join(lines) + "\n"
 
 
 def apply_nft(data: dict[str, dict[str, object]]) -> None:
-    if not data:
-        run("/usr/sbin/nft", "delete", "table", "bridge", "isolatevm_egress", check=False)
+    has_domain_policy = any(isinstance(record.get("rules"), list) and
+                             any(isinstance(rule, dict) and rule.get("kind") == "domain"
+                                 for rule in record["rules"])
+                             for record in data.values())
+    existing: list[tuple[str, str]] = []
+    for family, table in (("bridge", "isolatevm_egress"),
+                          ("inet", "isolatevm_domain_egress")):
+        current = run("/usr/sbin/nft", "list", "table", family, table, check=False)
+        if current.returncode == 0:
+            existing.append((family, table))
+    payload = "".join(f"delete table {family} {table}\n" for family, table in existing)
+    if data:
+        payload += render_nft(data)
+    if not payload:
         return
-    payload = render_nft(data)
-    current = run("/usr/sbin/nft", "list", "table", "bridge", "isolatevm_egress", check=False)
-    if current.returncode == 0:
-        # Delete and recreate the dedicated table in one nftables batch. nft
-        # applies the batch transactionally, so a failed update retains the
-        # previous filter instead of opening a direct-egress window.
-        payload = "delete table bridge isolatevm_egress\n" + payload
+    # Delete/recreate all IsolateVM tables in a single nftables batch. nft
+    # applies the batch transactionally, retaining the old firewall on error.
     run("/usr/sbin/nft", "--check", "--file", "-", input_text=payload)
     run("/usr/sbin/nft", "--file", "-", input_text=payload)
 
@@ -501,6 +590,26 @@ def ensure_bridge_netfilter() -> None:
 
 def unit(name_value: str, action: str) -> None:
     run("/usr/bin/systemctl", action, f"isolatevm-egress@{name_value}.service")
+
+
+def stop_disable_proxy(name_value: str) -> None:
+    """Stop and disable this owned instance before changing its policy."""
+    failure = False
+    for action in ("stop", "disable"):
+        try:
+            unit(name_value, action)
+        except (Error, OSError, subprocess.TimeoutExpired):
+            failure = True
+    if failure:
+        raise Error("proxy restrito não pôde ser parado e desabilitado com segurança")
+
+
+def best_effort_stop_disable_proxy(name_value: str) -> None:
+    for action in ("stop", "disable"):
+        try:
+            unit(name_value, action)
+        except (Error, OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def firewall_service(action: str) -> None:
@@ -550,22 +659,28 @@ def apply(request: dict[str, object], uid: int) -> dict[str, object]:
                                  "address": address, "gateway": gateway, "port": port,
                                  "mac": mac, "rules": allow, "owner_uid": uid,
                                  "name": name_value, "service_name": service_name}
-    ensure_bridge_netfilter()
-    ensure_firewall_guard()
-    if existing:
-        # Stop the old listener before replacing its policy. Otherwise a VM
-        # could keep using the previous, broader Squid ACL during the firewall
-        # update/restart window.
-        unit(service_name, "stop")
-    prepare_logs(service_name)
-    write_config(service_name, squid_config(service_name, address, gateway, port, allow))
-    if legacy:
-        del data[name_value]
-    data[key] = record
-    save_state(data)
-    apply_nft(data)
-    unit(service_name, "enable")
-    unit(service_name, "restart")
+    try:
+        ensure_bridge_netfilter()
+        ensure_firewall_guard()
+        # A policy update must not leave an old (possibly broader) listener
+        # available during config/state/firewall replacement or after reboot.
+        # Keep the existing source-MAC drop rule and persisted state in place
+        # until all new policy material has been written.
+        stop_disable_proxy(service_name)
+        prepare_logs(service_name)
+        write_config(service_name, squid_config(service_name, address, gateway, port, allow))
+        if legacy:
+            del data[name_value]
+        data[key] = record
+        save_state(data)
+        apply_nft(data)
+        unit(service_name, "enable")
+        unit(service_name, "restart")
+    except Exception:
+        # Preserve state, config, logs, and firewall for an idempotent retry;
+        # only stop/disable the service instance whose validated name we own.
+        best_effort_stop_disable_proxy(service_name)
+        raise
     return {"address": address, "gateway": gateway, "port": port, "mac": mac}
 
 
@@ -591,8 +706,7 @@ def remove(request: dict[str, object], uid: int) -> None:
     service_name = record.get("service_name", state_key)
     if not isinstance(service_name, str) or not re.fullmatch(r"(?:u[0-9]+-)?[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", service_name):
         raise Error("identificador de serviço de rede inválido")
-    unit(service_name, "stop")
-    unit(service_name, "disable")
+    stop_disable_proxy(service_name)
     target = CONFIG / f"{service_name}.conf"
     if target.exists(): target.unlink()
     for suffix in (".cache.log", ".access.log"):

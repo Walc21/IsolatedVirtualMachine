@@ -59,6 +59,8 @@ Consulte [SECURITY.md](SECURITY.md), [ARCHITECTURE.md](ARCHITECTURE.md), o [sche
 - A política de egress restrito requer o helper Polkit separado, Squid, nftables e Polkit.
 - Para console VGA, instale `virt-viewer` ou outro cliente SPICE compatível.
 
+O runner de CI usa Ubuntu 24.04. As validações de integração descritas neste repositório incluem VMs com imagens Ubuntu 24.04; versões posteriores podem funcionar, mas não há evidência documentada aqui.
+
 O aplicativo não configura Incus, não adiciona usuários a grupos privilegiados, não altera o firewall do host e não instala pacotes no host durante o provisionamento normal de uma VM. Revise as permissões e mudanças necessárias para sua instalação Incus antes de conceder acesso.
 
 ## Executar pelo código-fonte
@@ -93,7 +95,7 @@ Execute os testes GTK em uma sessão gráfica:
 ISOLATEVM_UI_TEST=1 python3 -m pytest -q
 ```
 
-O workflow do GitHub Actions executa os testes GTK via Xvfb, compila o pacote Python e constrói/inspeciona o `.deb` Ubuntu. Essas verificações não se conectam ao Incus nem comprovam o ciclo real de vida de VMs, rede ou login gráfico.
+O workflow do GitHub Actions usa um runner Ubuntu 24.04, compila os módulos Python, executa a suíte com smoke tests GTK via Xvfb e constrói/inspeciona o `.deb` Ubuntu. Essas verificações não se conectam ao Incus nem comprovam o ciclo real de vida de VMs, rede ou login gráfico.
 
 ## Construir o pacote Ubuntu
 

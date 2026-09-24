@@ -86,7 +86,7 @@ class TerminalMixin:
         try:
             terminal.spawn_async(
                 Vte.PtyFlags.DEFAULT, None, argv, envv, GLib.SpawnFlags.DEFAULT, None,
-                timeout=-1, cancellable=None, callback=spawned, user_data=None)
+                None, None, -1, None, spawned, None)
         except (GLib.Error, OSError, TypeError) as exc:
             self.terminal_status.set_text(f"Não foi possível iniciar o terminal: {exc}")
             self.terminal_widget = None

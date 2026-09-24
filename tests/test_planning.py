@@ -1,3 +1,5 @@
+import os
+
 from isolatevm.model import Manifest
 from isolatevm.mock import MockIncus
 from isolatevm.planning import CreationPlan, plan_creation
@@ -46,7 +48,7 @@ def test_plan_explains_lan_only_proxy_and_private_ranges():
     m = Manifest.parse({"schemaVersion": 1, "name": "lan-vm",
         "os": {"distribution": "ubuntu", "release": "24.04"},
         "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
-        "network": {"mode": "lan-only", "bridge": "incusbr-1000", "egress": [
+        "network": {"mode": "lan-only", "bridge": f"incusbr-{os.getuid()}", "egress": [
             {"kind": "cidr", "value": "192.168.1.0/24", "port": 5432}]},
         "security": {"profile": "restricted-development"}, "mounts": [], "software": {"apt": []}})
     service = MockIncus()

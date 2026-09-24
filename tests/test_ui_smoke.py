@@ -359,8 +359,8 @@ def activate(app):
     terminal.spawn_async(Vte.PtyFlags.DEFAULT, None,
                          ["/usr/bin/printf", "PTY_TERMINAL_OK"],
                          ["PATH=/usr/bin:/bin", "LANG=C.UTF-8"],
-                         GLib.SpawnFlags.DEFAULT, None, timeout=-1,
-                         cancellable=None, callback=spawned, user_data=None)
+                         GLib.SpawnFlags.DEFAULT, None, None, None, -1,
+                         None, spawned, None)
     window.present()
     GLib.timeout_add(5000, lambda: (state.update(error="VTE PTY timeout"), app.quit(), False)[-1])
 app.connect("activate", activate)

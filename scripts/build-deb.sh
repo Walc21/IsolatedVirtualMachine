@@ -32,12 +32,12 @@ cp "$project_dir/packaging/isolatevm-egress@.service" "$stage_dir/usr/lib/system
 cp "$project_dir/packaging/org.isolatevm.egress.policy" "$stage_dir/usr/share/polkit-1/actions/"
 cat > "$stage_dir/DEBIAN/control" <<'EOF'
 Package: isolatevm
-Version: 0.3.2
+Version: 0.3.8
 Section: admin
 Priority: optional
 Architecture: all
 Maintainer: IsolateVM Project <local@localhost>
-Depends: python3 (>= 3.11), python3-gi, python3-yaml, python3-secretstorage, gir1.2-gtk-4.0, gir1.2-adw-1, nftables, squid, polkitd
+Depends: python3 (>= 3.11), python3-gi, python3-yaml, python3-secretstorage, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-vte-3.91, nftables, squid, polkitd
 Recommends: incus-client
 Suggests: virt-viewer
 Description: Local graphical manager for Incus virtual machines
@@ -47,4 +47,4 @@ find "$stage_dir" -type d -exec chmod 0755 {} +
 find "$stage_dir" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage_dir/usr/bin/isolatevm"
 chmod 0755 "$stage_dir/usr/lib/isolatevm/isolatevm-egress-helper"
-dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.2_all.deb"
+dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.8_all.deb"

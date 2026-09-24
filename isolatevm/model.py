@@ -12,7 +12,8 @@ import yaml
 
 from .copy_source import (CopySourceError, MAX_COPY_BYTES, MAX_COPY_FILES,
                           canonical_source, scan_source, source_reference)
-from .software_catalog import EXTERNAL_TOOL_PACKAGES
+from .cpu import CPUSelectionError, format_cpu_set, parse_cpu_set
+from .software_catalog import (AIDER_SUPPORTED_RELEASES, EXTERNAL_TOOL_PACKAGES)
 
 NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]{0,127}\Z")
@@ -23,6 +24,10 @@ GO_PACKAGE = re.compile(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}/[a-zA-Z0-9][a-zA-Z0-9_.
 DOMAIN = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z")
 GUEST = re.compile(r"/(?:[a-zA-Z0-9_.-]+/?)+\Z")
 RELEASES = {"22.04", "24.04", "26.04"}
+BRIDGED_NETWORK_MODES = {"normal", "restricted", "lan-only"}
+PROXIED_NETWORK_MODES = {"restricted", "lan-only"}
+LAN_IPV4_NETWORKS = tuple(ipaddress.ip_network(value) for value in
+                          ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 DESKTOP_PACKAGES = {"gnome": "ubuntu-desktop-minimal", "kde": "kubuntu-desktop", "xfce": "xubuntu-desktop"}
 SENSITIVE = {".ssh", ".gnupg", ".aws", ".config", ".local", ".docker", ".kube"}
 SECURITY_PROFILES = {"maximum-isolation", "normal-development", "restricted-development", "custom"}
@@ -169,7 +174,7 @@ class EgressRule:
     def parse(cls, raw: Any) -> "EgressRule":
         item = _keys(raw, {"kind", "value", "port", "protocol"}, "Regra de saída")
         kind, value, port = item.get("kind"), item.get("value"), item.get("port")
-        if kind not in {"domain", "ip", "cidr"} or not isinstance(value, str):
+        if not isinstance(kind, str) or kind not in {"domain", "ip", "cidr"} or not isinstance(value, str):
             raise ValidationError("Regra de saída: tipo deve ser domain, ip ou cidr")
         if item.get("protocol", "tcp") != "tcp":
             raise ValidationError("Regra de saída: somente TCP é suportado pelo proxy HTTPS")
@@ -218,6 +223,7 @@ class Manifest:
     workspaceSizeGiB: int | None = None
     pipx: tuple[str, ...] = ()
     externalTools: tuple[str, ...] = ()
+    cpuPinning: str | None = None
 
     @classmethod
     def parse(cls, raw: Any, *, check_copy_sources: bool = True) -> "Manifest":
@@ -233,10 +239,10 @@ class Manifest:
         resources = _keys(item.get("resources"), {"cpu", "memoryMiB", "diskGiB", "pool"}, "Recursos")
         network = _keys(item.get("network", {"mode": "offline"}), {"mode", "bridge", "egress"}, "Rede")
         mode = network.get("mode")
-        if mode not in ("offline", "normal", "restricted"):
-            raise ValidationError("Rede: escolha offline, normal ou restricted")
+        if mode not in ("offline", "normal", "restricted", "lan-only"):
+            raise ValidationError("Rede: escolha offline, normal, restricted ou lan-only")
         bridge = network.get("bridge")
-        if mode in {"normal", "restricted"}:
+        if mode in BRIDGED_NETWORK_MODES:
             bridge = _name(bridge, "Bridge")
         elif bridge is not None:
             raise ValidationError("Rede offline não aceita bridge")
@@ -246,10 +252,17 @@ class Manifest:
         egress = tuple(EgressRule.parse(rule) for rule in rules_raw)
         if len(set(egress)) != len(egress):
             raise ValidationError("Rede: regras de saída duplicadas")
-        if mode == "restricted" and not egress:
+        if mode in PROXIED_NETWORK_MODES and not egress:
             raise ValidationError("Rede restrita exige ao menos uma regra de saída")
-        if mode != "restricted" and egress:
+        if mode not in PROXIED_NETWORK_MODES and egress:
             raise ValidationError("Regras de saída são exclusivas da rede restrita")
+        if mode == "lan-only":
+            for rule in egress:
+                if rule.kind != "cidr":
+                    raise ValidationError("LAN somente aceita CIDRs IPv4 privados e portas TCP explícitas")
+                network = ipaddress.ip_network(rule.value)
+                if not any(network.subnet_of(private) for private in LAN_IPV4_NETWORKS):
+                    raise ValidationError("LAN somente aceita apenas CIDRs dentro de 10/8, 172.16/12 ou 192.168/16")
         mounts_raw = item.get("mounts", [])
         if not isinstance(mounts_raw, list) or len(mounts_raw) > 16:
             raise ValidationError("Máximo de 16 mounts")
@@ -289,10 +302,10 @@ class Manifest:
         profile = security.get("profile")
         if not isinstance(profile, str) or profile not in SECURITY_PROFILES:
             raise ValidationError("Perfil de segurança desconhecido")
-        if profile == "restricted-development" and mode != "restricted":
-            raise ValidationError("Desenvolvimento restrito exige rede restricted com proxy de saída")
-        if mode == "restricted" and profile != "restricted-development":
-            raise ValidationError("Rede restrita exige o perfil restricted-development")
+        if profile == "restricted-development" and mode not in PROXIED_NETWORK_MODES:
+            raise ValidationError("Desenvolvimento restrito exige proxy de saída restricted ou LAN-only")
+        if mode in PROXIED_NETWORK_MODES and profile != "restricted-development":
+            raise ValidationError("Rede proxied exige o perfil restricted-development")
         if profile == "maximum-isolation" and (mode != "offline" or mounts):
             raise ValidationError("Máximo isolamento exige rede offline e nenhum compartilhamento do host")
         if profile == "maximum-isolation" and copies:
@@ -341,6 +354,9 @@ class Manifest:
         pipx = software.get("pipx", [])
         if not isinstance(pipx, list) or len(pipx) > 50 or any(not isinstance(p, str) or not PIP_PACKAGE.fullmatch(p) for p in pipx):
             raise ValidationError("Lista pipx inválida; use pacote ou pacote==versão exata")
+        if (any(package.partition("==")[0] == "aider-chat" for package in pipx) and
+                os_data["release"] not in AIDER_SUPPORTED_RELEASES):
+            raise ValidationError("Aider 0.86.2 requer Python 3.10 a 3.12; selecione Ubuntu 22.04 ou 24.04")
         external = software.get("external", [])
         if not isinstance(external, list) or len(external) > 16 or any(
                 not isinstance(tool, str) or tool not in EXTERNAL_TOOL_PACKAGES for tool in external):
@@ -360,12 +376,24 @@ class Manifest:
             raise ValidationError(".NET 8.0 não está na feed Ubuntu padrão de 26.04; configure uma fonte compatível explicitamente")
         if "dotnet-sdk-10.0" in packages and os_data["release"] == "22.04":
             raise ValidationError(".NET 10.0 não está na feed Ubuntu padrão de 22.04; configure uma fonte compatível explicitamente")
-        metadata = _keys(item.get("metadata", {}), {"template"}, "Metadados")
+        cpu_count = _integer(resources.get("cpu"), 1, 64, "CPU")
+        metadata = _keys(item.get("metadata", {}), {"template", "cpuPinning"}, "Metadados")
         template = metadata.get("template")
         if template is not None:
             template = _name(template, "Template")
+        cpu_pinning = metadata.get("cpuPinning")
+        if cpu_pinning is not None:
+            if not isinstance(cpu_pinning, str):
+                raise ValidationError("CPU pinning: esperado texto com IDs do host")
+            try:
+                selected_cpus = parse_cpu_set(cpu_pinning)
+            except CPUSelectionError as exc:
+                raise ValidationError(str(exc)) from None
+            if len(selected_cpus) != cpu_count:
+                raise ValidationError("CPU pinning: a quantidade de IDs deve corresponder ao número de vCPUs")
+            cpu_pinning = format_cpu_set(selected_cpus)
         return cls(1, _name(item.get("name"), "Nome"), os_data["release"],
-                   _integer(resources.get("cpu"), 1, 64, "CPU"),
+                   cpu_count,
                    _integer(resources.get("memoryMiB"), 512, 262144, "RAM"),
                    _integer(resources.get("diskGiB"), 8, 2048, "Disco"),
                    _name(resources.get("pool"), "Pool"), mode, bridge, egress,
@@ -373,7 +401,8 @@ class Manifest:
                    tuple(dict.fromkeys(npm)), template, profile,
                    tuple(sorted(environment.items())), desktop,
                    tuple(dict.fromkeys(cargo)), tuple(dict.fromkeys(go)), secrets, copies, disposition,
-                   workspace_size, tuple(dict.fromkeys(pipx)), tuple(dict.fromkeys(external)))
+                   workspace_size, tuple(dict.fromkeys(pipx)), tuple(dict.fromkeys(external)),
+                   cpu_pinning)
 
     def to_dict(self) -> dict[str, Any]:
         software = {"apt": list(self.apt), "pip": list(self.pip), "npm": list(self.npm),
@@ -394,7 +423,9 @@ class Manifest:
                 "security": {"profile": self.securityProfile},
                 "environment": dict(self.environment),
                 "software": software,
-                "metadata": {"template": self.template} if self.template else {}}
+                "metadata": {key: value for key, value in
+                             (("template", self.template), ("cpuPinning", self.cpuPinning))
+                             if value is not None}}
         if self.secrets:
             result["secrets"] = list(self.secrets)
         if self.copies:
@@ -424,6 +455,7 @@ class Manifest:
                  f"Tipo: {self.desktop.upper() if self.desktop else 'Headless'}"
                  + (f" · pacote {DESKTOP_PACKAGES[self.desktop]}" if self.desktop else ""),
                  f"CPU: {self.cpu} · RAM: {self.memoryMiB} MiB · Disco: {self.diskGiB} GiB ({self.pool})",
+                 *( [f"CPUs do host fixadas: {self.cpuPinning}"] if self.cpuPinning else [] ),
                  f"Rede: {self.networkMode}" + (f" via {self.bridge}" if self.bridge else ""),
                  f"Perfil de segurança: {self.securityProfile}",
                  f"Ciclo de vida: {self.lifecycleDisposition}",

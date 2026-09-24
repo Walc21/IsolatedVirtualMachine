@@ -26,6 +26,16 @@ def test_unix_api_is_read_only_and_enveloped(tmp_path):
     with pytest.raises(ApiError): api.get("/1.0/instances/victim/state/../delete")
     assert api.INSTANCE_STATE.fullmatch("/1.0/instances/dev-vm/state")
     assert api.STORAGE_RESOURCES.fullmatch("/1.0/storage-pools/default/resources")
+    assert api.INSTANCE_SNAPSHOTS.fullmatch("/1.0/instances/dev-vm/snapshots?recursion=1")
+    assert api.INSTANCE_SNAPSHOTS.fullmatch(
+        "/1.0/instances/dev-vm/snapshots?recursion=1&project=user-1234")
+    assert not api.INSTANCE_SNAPSHOTS.fullmatch(
+        "/1.0/instances/dev-vm/snapshots?recursion=1&project=default")
+    assert api.INSTANCE_SNAPSHOTS.fullmatch("/1.0/instances/dev-vm/snapshots?recursion=1")
+    assert api.INSTANCE_SNAPSHOTS.fullmatch(
+        "/1.0/instances/dev-vm/snapshots?recursion=1&project=user-1234")
+    assert not api.INSTANCE_SNAPSHOTS.fullmatch(
+        "/1.0/instances/dev-vm/snapshots?recursion=1&project=default")
     with pytest.raises(ApiError, match="Endpoint"):
         api.get("/1.0/storage-pools/default/../resources")
     assert api.get("/1.0") == {"api_extensions": []}

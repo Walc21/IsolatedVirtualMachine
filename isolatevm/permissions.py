@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from .workspace_volume import WORKSPACE_DEVICE
@@ -22,7 +23,7 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
     managed_instance = str(local_settings.get("user.isolatevm.managed", "")).lower() == "true" and not local.get("profiles")
     security_profile = str(local_settings.get("user.isolatevm.security-profile") or "externo/desconhecido")
     mounts: list[dict[str, Any]] = []
-    volumes: list[dict[str, str]] = []
+    volumes: list[dict[str, Any]] = []
     nics: list[dict[str, str]] = []
     other_devices: list[dict[str, str]] = []
     possible_network_devices: list[str] = []
@@ -46,7 +47,18 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
                 if source in {"/", str(Path.home())} or any(part in {".ssh", ".gnupg", ".aws", ".kube", ".docker"} for part in Path(source).parts):
                     warnings.append(f"Mount amplo ou sensível detectado: {source}.")
             else:
-                volumes.append({"device": name, "source": source or "não informado", "path": path or "?"})
+                local_device = _mapping(local_devices.get(name))
+                managed_data_volume = (
+                    managed_instance and re.fullmatch(r"isodata(?:[0-9]|[12][0-9]|3[01])", name) is not None and
+                    name in local_devices and local_device.get("type") == "disk" and
+                    local_device.get("pool") == raw.get("pool") and
+                    local_device.get("source") == raw.get("source") and
+                    local_device.get("path") == raw.get("path")
+                )
+                volumes.append({"device": name, "source": source or "não informado",
+                                "path": path or "?", "pool": str(raw.get("pool") or "não informado"),
+                                "mode": "RO" if str(raw.get("readonly", "false")).lower() == "true" else "RW",
+                                "managed": managed_data_volume, "size": "não informado"})
                 managed_workspace_volume = managed_workspace_volume or (
                     name == WORKSPACE_DEVICE and managed_instance and name in local_devices and
                     local_settings.get("user.isolatevm.lifecycle-disposition") == "persist-workspace" and
@@ -58,7 +70,7 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
                          "nictype": str(raw.get("nictype") or "não informado")})
         else:
             other = {"device": name, "type": kind,
-                     "managed": managed_instance and ((kind == "usb" and name.startswith("isousb") and name[6:].isdigit()) or (kind == "gpu" and name.startswith("isogpu") and name[6:].isdigit())) and name in local_devices}
+                     "managed": managed_instance and ((kind == "usb" and name.startswith("isousb") and name[6:].isdigit()) or (kind == "gpu" and name.startswith("isogpu") and name[6:].isdigit()) or (kind == "pci" and name.startswith("isopci") and name[6:].isdigit())) and name in local_devices}
             if kind == "usb":
                 identity = f"{raw.get('vendorid', '?')}:{raw.get('productid', '?')}"
                 if raw.get("serial"):
@@ -68,6 +80,8 @@ def describe_effective(config: dict[str, Any], local: dict[str, Any]) -> dict[st
                 other["identity"] = identity
             elif kind == "gpu":
                 other["identity"] = str(raw.get("pci", "PCI desconhecido"))
+            elif kind == "pci":
+                other["identity"] = str(raw.get("address", "PCI desconhecido"))
             other_devices.append(other)
             if kind not in NETWORK_SAFE_DEVICE_TYPES:
                 possible_network_devices.append(f"{name} ({kind})")

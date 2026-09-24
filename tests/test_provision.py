@@ -19,7 +19,9 @@ def test_cloud_init_uses_argv_lists_inside_guest():
     data = yaml.safe_load(config[len("#cloud-config\n"):])
     assert data["packages"] == ["git", "python3", "python3-venv", "nodejs", "npm"]
     assert data["runcmd"][1] == ["/opt/isolatevm/python/bin/pip", "install", "requests==2.32.3"]
-    assert data["runcmd"][2] == ["npm", "install", "--global", "typescript@5.0.0"]
+    assert data["runcmd"][2] == ["/usr/sbin/runuser", "--user", "ubuntu", "--", "/usr/bin/env",
+                                 "npm_config_prefix=/home/ubuntu/.local", "/usr/bin/npm",
+                                 "install", "--global", "typescript@5.0.0"]
 
 
 def test_package_specs_reject_options_and_shell_text():
@@ -95,6 +97,25 @@ def test_codex_cli_is_guest_package_without_secret():
     assert "OPENAI_API_KEY" not in config
 
 
+def test_ai_coding_packages_use_guest_user_and_keep_authentication_out_of_cloud_init():
+    m = manifest({"apt": [], "pip": [],
+                  "pipx": ["aider-chat==0.86.2"],
+                  "npm": ["@openai/codex@latest", "@anthropic-ai/claude-code@latest",
+                          "opencode-ai@latest"]})
+    data = yaml.safe_load(cloud_config(m)[len("#cloud-config\n"):])
+    npm_install = next(command for command in data["runcmd"] if "/usr/bin/npm" in command)
+    assert npm_install[:4] == ["/usr/sbin/runuser", "--user", "ubuntu", "--"]
+    assert "npm_config_prefix=/home/ubuntu/.local" in npm_install
+    assert npm_install[-3:] == ["@openai/codex@latest", "@anthropic-ai/claude-code@latest",
+                                "opencode-ai@latest"]
+    assert ["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install",
+            "aider-chat==0.86.2"] in data["runcmd"]
+    profile = next(item for item in data["write_files"]
+                   if item["path"] == "/etc/profile.d/isolatevm-user-tools.sh")
+    assert "/home/ubuntu/.local/bin" in profile["content"]
+    assert "OPENAI_API_KEY" not in yaml.safe_dump(data)
+
+
 def test_pinned_cargo_and_go_tools_use_structured_guest_commands():
     m = manifest({"apt": [], "cargo": ["ripgrep@14.1.1"],
                   "go": ["golang.org/x/tools/gopls@v0.20.0"]})
@@ -118,7 +139,7 @@ def test_python_cli_tools_use_pipx_as_the_guest_user_and_pinned_versions():
         ["/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "install", "poetry==2.5.1"],
     ]
     path_file = next(item for item in data["write_files"]
-                     if item["path"] == "/etc/profile.d/isolatevm-pipx.sh")
+                     if item["path"] == "/etc/profile.d/isolatevm-user-tools.sh")
     assert "/home/ubuntu/.local/bin" in path_file["content"]
     assert path_file["owner"] == "root:root" and path_file["permissions"] == "0644"
 

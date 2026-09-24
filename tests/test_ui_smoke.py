@@ -253,21 +253,29 @@ import os
 import traceback
 from gi.repository import GLib, Gtk
 from isolatevm.metrics import MetricsSnapshot
+from isolatevm.storage import save_instance_manifest
 from isolatevm.ui import IsolateApp
 app = IsolateApp()
 def flow():
     window = app.get_active_window()
     window.stack.set_visible_child_name("wizard")
     window.catalog_checks["curl"].set_active(True)
+    for package in ("@openai/codex@latest", "@anthropic-ai/claude-code@latest",
+                    "aider-chat==0.86.2", "opencode-ai@latest"):
+        window.ai_coding_checks[package].set_active(True)
     for _ in range(11): window._next()
     assert window.current_manifest is not None
     assert window.current_manifest.securityProfile == "maximum-isolation"
     assert window.current_manifest.desktop is None
     assert "curl" in window.current_manifest.apt
+    assert set(window.current_manifest.npm) == {
+        "@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"}
+    assert window.current_manifest.pipx == ("aider-chat==0.86.2",)
     window._next()
     assert window.wizard_step == 12
     assert window.next_btn.get_label() == "Criar ambiente"
     window.service.create(window.current_manifest)
+    save_instance_manifest(window.current_manifest)
     window.service.change_state(window.current_manifest.name, "start")
     card_box = Gtk.Box()
     window._vm_card(window.service.list_vms()[0], card_box,
@@ -303,6 +311,12 @@ def finish():
         assert "Acessos ao Host · pastas" in labels
         assert "Rede" in labels
         assert "Perfis Incus" in labels
+        assert "Inventário observado no guest" in labels
+        assert window.terminal_page is not None
+        window._open_integrated_terminal("novo-ambiente")
+        assert window.stack.get_visible_child_name() == "terminal"
+        assert window.terminal_status.get_text() == "Terminal real indisponível no modo mock."
+        assert window.terminal_widget is None
         window.close()
         app.quit()
     except BaseException:
@@ -314,6 +328,48 @@ app.run([])
 '''
     env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
     subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+
+
+@pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
+                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
+def test_vte_terminal_spawns_fixed_argv_in_a_pty():
+    script = '''
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Vte", "3.91")
+from gi.repository import GLib, Gtk, Vte
+app = Gtk.Application(application_id="org.isolatevm.VteSmoke", flags=0)
+state = {"error": None, "ok": False}
+def activate(app):
+    window = Gtk.ApplicationWindow(application=app)
+    terminal = Vte.Terminal()
+    window.set_child(terminal)
+    def exited(widget, status):
+        output = widget.get_text_format(Vte.Format.TEXT) or ""
+        state["ok"] = status == 0 and "PTY_TERMINAL_OK" in output
+        app.quit()
+    def spawned(widget, pid, error, _data):
+        if error is not None:
+            state["error"] = str(error)
+            app.quit()
+        else:
+            widget.watch_child(pid)
+    terminal.connect("child-exited", exited)
+    terminal.spawn_async(Vte.PtyFlags.DEFAULT, None,
+                         ["/usr/bin/printf", "PTY_TERMINAL_OK"],
+                         ["PATH=/usr/bin:/bin", "LANG=C.UTF-8"],
+                         GLib.SpawnFlags.DEFAULT, None, timeout=-1,
+                         cancellable=None, callback=spawned, user_data=None)
+    window.present()
+    GLib.timeout_add(5000, lambda: (state.update(error="VTE PTY timeout"), app.quit(), False)[-1])
+app.connect("activate", activate)
+app.run([])
+if state["error"] or not state["ok"]:
+    raise SystemExit(state["error"] or "VTE PTY did not deliver child output")
+'''
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=8,
+                   env=os.environ.copy())
 
 
 @pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
@@ -384,8 +440,9 @@ def flow():
                "mounts": [{"host": str(first), "guest": "/workspace", "mode": "rw"},
                           {"host": str(second), "guest": "/datasets", "mode": "ro"}],
                "software": {"apt": ["git", "postgresql-client", "golang-go", "pipx", "docker.io", "python3", "python3-pip", "dotnet-sdk-10.0"],
-                            "pipx": ["uv==0.12.18", "poetry==2.5.1"],
-                            "npm": ["bun@1.4.2", "@pnpm/exe@12.5.1"],
+                            "pipx": ["uv==0.12.18", "poetry==2.5.1", "aider-chat==0.86.2"],
+                            "npm": ["bun@1.4.2", "@pnpm/exe@12.5.1", "@openai/codex@latest",
+                                    "@anthropic-ai/claude-code@latest", "opencode-ai@latest"],
                             "external": ["helm@community", "terraform@hashicorp", "kubectl@1.37"],
                             "cargo": ["ripgrep@14.1.1"], "go": ["golang.org/x/tools/gopls@v0.20.0"]},
                "environment": {"NODE_ENV": "development"}}
@@ -403,6 +460,10 @@ def flow():
             assert window.catalog_checks["external:helm@community"].get_active()
             assert window.catalog_checks["external:terraform@hashicorp"].get_active()
             assert window.catalog_checks["external:kubectl@1.37"].get_active()
+            assert window.ai_coding_checks["@openai/codex@latest"].get_active()
+            assert window.ai_coding_checks["@anthropic-ai/claude-code@latest"].get_active()
+            assert window.ai_coding_checks["aider-chat==0.86.2"].get_active()
+            assert window.ai_coding_checks["opencode-ai@latest"].get_active()
             assert window.dotnet10_check.get_active()
             assert window.python_check.get_active()
             assert window.cargo_input.get_text() == "ripgrep@14.1.1"

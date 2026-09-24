@@ -28,6 +28,7 @@ jobs:
             dpkg-dev \
             gir1.2-adw-1 \
             gir1.2-gtk-4.0 \
+            gir1.2-vte-3.91 \
             python3-gi \
             python3-pytest \
             python3-yaml \
@@ -43,4 +44,4 @@ jobs:
         run: ./scripts/build-deb.sh
 
       - name: Inspect package metadata
-        run: dpkg-deb --field dist/isolatevm_0.3.2_all.deb Package Version Architecture
+        run: dpkg-deb --field dist/isolatevm_0.3.8_all.deb Package Version Architecture

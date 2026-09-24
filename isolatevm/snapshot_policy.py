@@ -7,7 +7,8 @@ import secrets
 
 PROTECTED_ACTIONS = frozenset({
     "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove",
-    "network-block", "network-restore", "resources", "snapshot-restore",
+    "pci-add", "pci-remove",
+    "network-block", "network-restore", "resources", "disk-grow", "cpu-pin", "snapshot-restore",
 })
 
 

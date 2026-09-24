@@ -2,6 +2,8 @@
 
 This file records capabilities exercised against a locally configured Incus daemon. These observations are evidence from one test environment, not a guarantee for every Incus version, host policy, image, network, or storage backend. The automated test suite uses mocks and does not replace these live checks.
 
+The integrated VTE terminal is covered by the GTK mock flow and argv/environment unit tests. Opening a PTY to a real guest still requires a running VM and an authorized Incus connection; no live terminal session was started during this revision.
+
 ## Exercised flows
 
 - Created and removed disposable Ubuntu cloud VMs through both the backend and GTK wizard using a restricted user project, explicit storage, and explicit network configuration.
@@ -18,8 +20,11 @@ This file records capabilities exercised against a locally configured Incus daem
 - On 2026-09-24, the GTK mock preview showed effective CPU/RAM before and after values, exposed Cancel/Apply, and refused an Apply after CPU was changed between preview and click. A live Incus check created a disposable stopped VM from a verified locally cached Ubuntu 24.04 cloud image, read its effective CPU/RAM into the same diff, then exercised the protection snapshot and resource change; the VM was removed. The first attempt to run the live script through `LocalIncus.create` stopped before creating a VM because the remote image catalog lookup timed out after 120 seconds. The cached-image check does not prove that the remote image catalog is currently reachable or that every mutation preview has been exercised live.
 - On 2026-09-24, GTK mock coverage verified that `delete-on-close` deletes the VM plus local manifest only after Apply and that `restore-initial-on-close` leaves the VM present with its protected initial snapshot and manifest. Cancel preserved both VMs. Wizard import/export round-trip preserved the lifecycle choice. This did not exercise close-time deletion or restore against a live Incus daemon.
 - On 2026-09-24, `scripts/live-lifecycle-restore-smoke.py` used the cached Ubuntu 24.04 image in restricted `user-1000`: `LocalIncus.create` made `isolatevm-initial`, CPU was changed from 2 to 1, and the close-lifecycle path restored CPU 2 while retaining the VM stopped. The temporary VM and local manifest were removed. This exercised backend create/snapshot/restore against Incus, while the confirmation dialog itself remains covered by GTK mock tests.
+- On 2026-09-24, `scripts/live-software-inventory-smoke.py` created a disposable offline Ubuntu 24.04 VM in restricted `user-1000`, then queried its actual `dpkg-query` output. It reported the base `python3` package with a version and marked a deliberately absent package as missing. No package was installed; the temporary VM and local data directory were removed. The other manager parsers and queries remain covered by tests, not live boot validation.
 - On 2026-09-24, `scripts/live-workspace-lifecycle-smoke.py` used the cached Ubuntu 24.04 image and Incus 6.0.5 in restricted project `user-1000`. It created a 4 GiB custom filesystem volume, verified cloud-init set `/workspace` to UID/GID 1000 and mode `0750`, and confirmed a file written by UID 1000 survived restoring the initial VM snapshot while a root-disk marker and CPU change were reverted. A stopped-VM clone received a separate volume, preserved the source data, and isolated a clone-only write. The smoke then changed the clone's CPU, exercised its close-lifecycle restore to the clone's own initial snapshot, and confirmed clone-only data remained in the clone's volume. The custom volume export was nonempty and mode `0600`; explicit deletion removed both volumes. Final Incus instance and custom-volume inventories were empty. The close confirmation itself is covered by GTK mock tests; no host paths or network devices were attached.
 - On 2026-09-24, the guest software catalog gained .NET SDK 8.0/10.0 choices validated against the selected Ubuntu release, pinned uv/Poetry pipx entries, pinned pnpm standalone/Yarn/Bun npm entries, opt-in Rustup stable-channel installation as the guest user, and explicit kubectl/Helm/Terraform upstream choices. Manifest, cloud-init, and GTK mock tests inspect repo identities, signing-key fingerprints, and structured argv. These software paths have not been boot-tested in a live VM.
+- On 2026-09-24, the wizard added opt-in Codex, Claude Code, Aider 0.86.2, and OpenCode choices. Manifest compatibility, catalog selection/import round-trip, Ubuntu release rejection for Aider on 26.04, cloud-init argv, and guest-user npm inventory are covered by tests. npm installs now run as guest user `ubuntu` under `/home/ubuntu/.local`; none of the new AI tool packages has been boot-tested in a live VM. Authentication is not provisioned or copied from the host.
+- Root-disk growth is covered by typed Incus argv tests, an effective-state grow-only diff, stopped-VM checks, mock lifecycle tests, and automatic protection-snapshot policy. No live root disk was resized in this revision.
 - The USB selection path now re-enumerates sysfs before attachment and refuses a changed selection. It passes a unique device serial to Incus, or the current bus/device address when the serial is absent or duplicated. Automated coverage exercises the inventory parsing, identity display data, unique/duplicate serial selection, and stale-selection rejection. No physical USB device was attached, so hardware behavior remains unverified.
 
 ## Host integration boundaries
@@ -30,12 +35,15 @@ This file records capabilities exercised against a locally configured Incus daem
 - The `0.2.9` `.deb` replaced installed version `0.2.8`; `/usr/bin/python3` imported version `0.2.9`. `python3-secretstorage` and `python3-jeepney` remain installed.
 - A host Docker forwarding policy can block traffic from a regular Incus bridge. The optional `packaging/isolatevm-docker-forward.*` files document a narrow operator-managed workaround; it is not installed or enabled by the IsolateVM package.
 - The restricted egress helper and Squid are separate from the GTK process. Normal networking remains unfiltered; only the restricted policy applies the tested domain/port allowlist.
+- LAN-only is new in this source revision and has only offline schema/helper tests; it has not been tried against a real private subnet or host route. Custom bridge selection enumerates managed Incus bridges and does not create or alter host networks.
 
 ## Not verified or out of scope
 
 - Visual login and an interactive session inside GNOME, KDE, or XFCE guests.
 - Behavior on every Incus version, cloud image, storage driver, bridge topology, or host firewall.
-- General PCI/serial passthrough and non-Ubuntu guests.
+- Physical USB, GPU, and generic PCI passthrough. Only the read-only inventories, stale-selection checks, explicit UI review, typed backend arguments, and mocks are covered here.
+- CPU pinning through Incus `limits.cpu` ranges, desktop login interaction, and root-disk growth against a real VM.
+- Virtual serial devices on VMs (unsupported by Incus) and non-Ubuntu guests.
 - Host reboot persistence of any manually installed networking workaround.
 
 Repeat live checks in a disposable Incus project before relying on them in a different environment. The project test suite and package build can be run without connecting to Incus; see [DEVELOPMENT.md](../DEVELOPMENT.md).

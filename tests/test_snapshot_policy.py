@@ -49,6 +49,7 @@ def test_settings_preserve_theme_and_snapshot_preference(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         protection_name("delete")
     assert "snapshot-restore" in PROTECTED_ACTIONS
+    assert "disk-grow" in PROTECTED_ACTIONS
 
 
 def test_protection_snapshot_precedes_change_and_is_audited(tmp_path, monkeypatch):

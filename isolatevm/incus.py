@@ -23,7 +23,8 @@ from .access import local_socket
 from .copy_source import CopySourceError, MAX_COPY_BYTES, MAX_COPY_FILES, open_source_file, scan_source
 from .egress import EgressError, apply as apply_egress, remove as remove_egress
 from .model import (BRIDGED_NETWORK_MODES, PROXIED_NETWORK_MODES, GUEST,
-                    INITIAL_SNAPSHOT, Manifest, Mount, ValidationError, _integer, _name)
+                    INITIAL_SNAPSHOT, Manifest, Mount, ValidationError, _integer, _name,
+                    validate_mount_set)
 from .metrics import MetricsSnapshot, parse_state
 from .cpu import (CPUSelectionError, cpu_ids as parse_host_cpu_ids,
                   format_cpu_set, parse_cpu_set)
@@ -384,7 +385,8 @@ class LocalIncus:
         if "rustup" in manifest.apt:
             try:
                 output = self._run("exec", name, "--", "/usr/sbin/runuser", "--user", "ubuntu", "--",
-                                   "/home/ubuntu/.cargo/bin/rustc", "--version", timeout=30)
+                                   "/home/ubuntu/.cargo/bin/rustc", "--version", timeout=30,
+                                   output_limit_bytes=4096)
                 version = parse_rustc(output)
                 result.append(SoftwareInventoryEntry("rustup", "stable toolchain",
                                                      "installed" if version else "missing", version))
@@ -854,7 +856,8 @@ class LocalIncus:
         while True:
             try:
                 self._run("exec", name, "--force-noninteractive", "--user", "0", "--",
-                          "/usr/bin/test", "-f", "/usr/local/lib/isolatevm/copy-files", timeout=20)
+                          "/usr/bin/test", "-f", "/usr/local/lib/isolatevm/copy-files", timeout=20,
+                          output_limit_bytes=4096)
                 break
             except IncusError:
                 if time.monotonic() >= deadline:
@@ -1046,6 +1049,8 @@ class LocalIncus:
         local = self._local_instance_config(name)
         settings = local.get("config") if isinstance(local.get("config"), dict) else {}
         managed = settings.get("user.isolatevm.managed") == "true" and local.get("profiles") == []
+        if not managed:
+            raise IncusError(f"Propriedade da VM não pôde ser confirmada: {name}; nada foi excluído")
         disposition = settings.get("user.isolatevm.lifecycle-disposition")
         workspace_marker = settings.get("user.isolatevm.workspace-volume")
         workspace: tuple[str, str] | None = None
@@ -1054,9 +1059,7 @@ class LocalIncus:
                 raise IncusError(f"Propriedade da VM/volume /workspace não pôde ser confirmada: {name}; nada foi excluído")
             workspace = self._verify_workspace_device(name, local)
         devices = local.get("devices") if isinstance(local.get("devices"), dict) else {}
-        data_volumes: list[tuple[str, str]] = []
-        if any(DATA_DEVICE.fullmatch(device) for device in devices) and not managed:
-            raise IncusError(f"Propriedade da VM não pôde ser confirmada: {name}; nada foi excluído")
+        data_volumes: list[tuple[str, str, int]] = []
         for device, raw in devices.items():
             if not DATA_DEVICE.fullmatch(device):
                 continue
@@ -1071,18 +1074,20 @@ class LocalIncus:
             if not isinstance(size_marker, str) or not size_marker.isdigit():
                 raise IncusError(f"Tamanho do disco de dados não pôde ser confirmado: {pool}/{volume}; nada foi excluído")
             self._verify_data_volume(pool, volume, name, int(size_marker))
-            data_volumes.append((pool, volume))
+            data_volumes.append((pool, volume, int(size_marker)))
         self._run("delete", name, "--force", timeout=300)
-        for pool, volume in data_volumes:
+        for pool, volume, size_gib in data_volumes:
             try:
+                self._verify_data_volume(pool, volume, name, size_gib)
                 self._run("storage", "volume", "delete", pool, volume, timeout=300)
-            except IncusError as exc:
+            except Exception as exc:
                 raise IncusError(f"VM removida, mas o disco de dados {pool}/{volume} continua preservado; revise ou remova esse volume manualmente: {exc}") from exc
         if workspace is not None:
             pool, volume = workspace
             try:
+                self._verify_workspace_volume(pool, volume, name)
                 self._run("storage", "volume", "delete", pool, volume, timeout=300)
-            except IncusError as exc:
+            except Exception as exc:
                 raise IncusError(f"VM removida, mas os dados persistentes de /workspace continuam no volume {volume} ({pool}); revise ou remova esse volume manualmente: {exc}") from exc
         if restricted:
             try:
@@ -1163,6 +1168,9 @@ class LocalIncus:
             raise IncusError("Já existe uma VM com esse nome")
         source_local = self._local_instance_config(source)
         source_settings = source_local.get("config") if isinstance(source_local.get("config"), dict) else {}
+        if (source_settings.get("user.isolatevm.managed") != "true" or
+                source_local.get("profiles") != []):
+            raise IncusError(f"Propriedade da VM de origem não pôde ser confirmada: {source}; clone recusado")
         source_disposition = source_settings.get("user.isolatevm.lifecycle-disposition")
         workspace: tuple[str, str, int] | None = None
         target_volume: str | None = None
@@ -1202,6 +1210,7 @@ class LocalIncus:
                 raise IncusError(f"O volume do clone já existe: {target_volume}; verifique órfãos antes de reutilizar")
         volume_created = False
         instance_created = False
+        clone_attempted = False
         # A clone is persistent by default; disposable behavior requires a new
         try:
         # explicit choice for ordinary VMs. A persisted /workspace clone keeps
@@ -1223,6 +1232,7 @@ class LocalIncus:
                 self._run("storage", "volume", "set", pool, copied_volume,
                           f"user.isolatevm.owner={target}", timeout=300)
                 self._verify_data_volume(pool, copied_volume, target, size_gib)
+            clone_attempted = True
             self._run("copy", source, target,
                       *( ["--instance-only"] if workspace is not None or data_volumes else [] ), timeout=1200)
             instance_created = True
@@ -1245,15 +1255,18 @@ class LocalIncus:
                 self._run("config", "set", target, "user.isolatevm.lifecycle-disposition=persistent")
         except Exception as exc:
             cleanup_errors: list[str] = []
-            if not instance_created:
-                try:
-                    instance_created = any(vm.name == target for vm in self.list_vms())
-                except Exception as inspect_error:
-                    cleanup_errors.append(f"estado da VM {target} não confirmado: {inspect_error}")
             if instance_created:
-                try: self._run("delete", target, "--force", timeout=300)
-                except IncusError as cleanup: cleanup_errors.append(f"VM {target}: {cleanup}")
-            if volume_created and target_volume is not None and workspace is not None:
+                try:
+                    target_local = self._local_instance_config(target)
+                    target_settings = target_local.get("config") if isinstance(target_local.get("config"), dict) else {}
+                    if (target_settings.get("user.isolatevm.managed") != "true" or
+                            target_local.get("profiles") != []):
+                        raise IncusError("ownership marker ou profiles da VM clonada não conferem")
+                    self._run("delete", target, "--force", timeout=300)
+                except Exception as cleanup:
+                    cleanup_errors.append(f"VM {target} preservada para revisão: {cleanup}")
+            may_remove_volumes = not clone_attempted or instance_created and not cleanup_errors
+            if may_remove_volumes and volume_created and target_volume is not None and workspace is not None:
                 try:
                     try:
                         self._verify_workspace_volume(workspace[0], target_volume, target, workspace[2])
@@ -1263,7 +1276,7 @@ class LocalIncus:
                                                       source, workspace[2])
                     self._run("storage", "volume", "delete", workspace[0], target_volume, timeout=300)
                 except Exception as cleanup: cleanup_errors.append(f"volume {target_volume}: {cleanup}")
-            for pool, _device, copied_volume, size_gib in target_data_volumes:
+            for pool, _device, copied_volume, size_gib in (target_data_volumes if may_remove_volumes else []):
                 try:
                     if not self._workspace_volume_exists(pool, copied_volume):
                         continue
@@ -1273,6 +1286,8 @@ class LocalIncus:
                     cleanup_errors.append(f"volume {copied_volume}: {cleanup}")
             if cleanup_errors:
                 raise IncusError(f"Clone falhou; a limpeza falhou e exige revisão: {'; '.join(cleanup_errors)}") from exc
+            if clone_attempted and not instance_created:
+                raise IncusError(f"Resultado da criação de {target} ficou incerto; VM e volumes associados foram preservados para revisão") from exc
             raise
 
     def effective(self, name: str) -> dict[str, Any]:
@@ -1321,20 +1336,27 @@ class LocalIncus:
         if self._security_profile(name) == "maximum-isolation":
             raise ValidationError("Máximo isolamento impede compartilhar pastas do host")
         mount = Mount.parse({"host": mount.host, "guest": mount.guest, "mode": mount.mode})
-        try:
-            declared_copies = load_instance_manifest(name).copies
-        except (OSError, ValidationError):
-            declared_copies = ()
-        destination = Path(mount.guest)
-        if any(destination == Path(copy.guest) or destination in Path(copy.guest).parents or
-               Path(copy.guest) in destination.parents for copy in declared_copies):
-            raise ValidationError("Mount se sobrepõe ao destino de uma cópia única")
-        self._check_host_mount_policy((mount,))
         current = self.effective(name)
-        guest = Path(mount.guest)
-        if any(guest == Path(x["path"]) or guest in Path(x["path"]).parents or Path(x["path"]) in guest.parents
-               for x in current["mounts"] + current["volumes"]):
-            raise ValidationError("Destino se sobrepõe a outro mount")
+        local = self._local_instance_config(name)
+        settings = local.get("config")
+        copy_state = settings.get("user.isolatevm.copy-state", "none") if isinstance(settings, dict) else None
+        if copy_state in {"pending", "done"}:
+            try:
+                declared_copies = load_instance_manifest(name).copies
+            except (OSError, ValidationError) as exc:
+                raise IncusError("Manifesto de cópia da VM indisponível; mount incremental recusado") from exc
+        elif copy_state == "none":
+            declared_copies = ()
+        else:
+            raise IncusError("Estado de cópia da VM não pôde ser confirmado; mount incremental recusado")
+        existing_mounts = [(item.get("source"), item.get("path"))
+                           for item in current.get("mounts", [])]
+        volume_targets = [item.get("path") for item in current.get("volumes", [])]
+        validate_mount_set((mount,), declared_copies,
+                           profile=current.get("security_profile"),
+                           existing_mounts=existing_mounts,
+                           guest_volume_targets=volume_targets)
+        self._check_host_mount_policy((mount,))
         used = set(current["config"].get("devices", {}))
         device = next((f"isovm{i}" for i in range(100) if f"isovm{i}" not in used), None)
         if not device: raise IncusError("Limite de mounts gerenciados alcançado")
@@ -1402,6 +1424,13 @@ class LocalIncus:
         current = self._local_devices(name); used = set(current)
         slot = next((f"isogpu{i}" for i in range(8) if f"isogpu{i}" not in used), None)
         if slot is None: raise IncusError("Limite de GPUs gerenciadas alcançado")
+        # Inventory objects originate from an earlier preview and can become
+        # stale while the user reviews the passthrough. Re-enumerate sysfs at
+        # the final boundary and require the same PCI address and device IDs.
+        live = next((item for item in host_gpu_devices() if item.pci == device.pci), None)
+        if (live is None or (live.pci, live.vendor_id, live.product_id) !=
+                (device.pci, device.vendor_id, device.product_id)):
+            raise ValidationError("A GPU mudou desde a seleção; atualize a lista e revise novamente")
         self._run("config", "device", "add", name, slot, "gpu", "gputype=physical", f"pci={device.pci}",
                   f"vendorid={device.vendor_id}", f"productid={device.product_id}", timeout=300)
 

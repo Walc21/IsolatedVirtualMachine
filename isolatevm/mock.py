@@ -11,7 +11,8 @@ from typing import Any, Callable
 from .incus import (DATA_DEVICE, IncusError, ProvisioningStatus, SnapshotInfo, VM,
                     validate_data_volume)
 from .model import (PROXIED_NETWORK_MODES, BRIDGED_NETWORK_MODES, INITIAL_SNAPSHOT,
-                    Manifest, Mount, ValidationError, _integer, _name)
+                    Manifest, Mount, ValidationError, _integer, _name,
+                    validate_mount_set)
 from .metrics import MetricsSnapshot
 from .permissions import describe_effective
 from .usb import UsbDevice, host_usb_devices
@@ -290,16 +291,13 @@ class MockIncus:
         if self.items[name][0].securityProfile == "maximum-isolation":
             raise ValidationError("Máximo isolamento impede compartilhar pastas do host")
         validated = Mount.parse({"host": mount.host, "guest": mount.guest, "mode": mount.mode})
-        destination = Path(validated.guest)
-        if any(destination == Path(copy.guest) or destination in Path(copy.guest).parents or
-               Path(copy.guest) in destination.parents for copy in self.items[name][0].copies):
-            raise ValidationError("Mount se sobrepõe ao destino de uma cópia única")
         current = self.effective(name)
-        guest = Path(validated.guest)
-        if any(guest == Path(x["path"]) or guest in Path(x["path"]).parents or
-               Path(x["path"]) in guest.parents
-               for x in current["mounts"] + current["volumes"]):
-            raise ValidationError("Destino se sobrepõe a outro mount ou volume")
+        existing = [(x["source"], x["path"]) for x in current["mounts"]]
+        volume_targets = [x["path"] for x in current["volumes"]]
+        validate_mount_set((validated,), self.items[name][0].copies,
+                           profile=self.items[name][0].securityProfile,
+                           existing_mounts=existing,
+                           guest_volume_targets=volume_targets)
         owned = self.mount_state[name]
         device = next((f"isovm{i}" for i in range(100) if f"isovm{i}" not in owned), None)
         if not device: raise IncusError("Limite de mounts alcançado")

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from isolatevm.model import Manifest, ValidationError
-from isolatevm.storage import (complete_onboarding, first_run, load_instance_manifest, load_template,
+from isolatevm.storage import (audit, complete_onboarding, first_run, history, load_instance_manifest, load_template,
                                load_theme, save_instance_manifest, save_template, save_theme,
                                save_template_versioned, export_manifest, export_manifest_versioned, import_manifest,
                                saved_network_bridge)
@@ -57,12 +57,12 @@ def test_ai_coding_tools_use_validated_package_managers_and_supported_aider_pyth
     manifest = Manifest.parse(sample(software={
         "apt": [],
         "pipx": ["aider-chat==0.86.2"],
-        "npm": ["@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"],
+        "npm": ["@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276", "opencode-ai@1.18.31"],
     }))
     assert Manifest.from_yaml(manifest.to_yaml()) == manifest
     assert manifest.to_dict()["software"]["pipx"] == ["aider-chat==0.86.2"]
     assert manifest.to_dict()["software"]["npm"] == [
-        "@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"]
+        "@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276", "opencode-ai@1.18.31"]
 
     with pytest.raises(ValidationError, match="Aider 0.86.2 requer Python"):
         Manifest.parse(sample(os={"distribution": "ubuntu", "release": "26.04"},
@@ -119,7 +119,7 @@ def test_persistent_workspace_rejects_overlapping_host_mounts(tmp_path, monkeypa
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     project = tmp_path / "project"; project.mkdir()
     for guest in ("/workspace", "/workspace/nested"):
-        with pytest.raises(ValidationError, match="mounts host sobrepostos"):
+        with pytest.raises(ValidationError, match="mounts host"):
             Manifest.parse(sample(lifecycle={"disposition": "persist-workspace"},
                                   mounts=[{"host": str(project), "guest": guest, "mode": "ro"}]))
     assert Manifest.parse(sample(lifecycle={"disposition": "persist-workspace", "workspaceSizeGiB": 2048})).workspaceSizeGiB == 2048
@@ -308,6 +308,46 @@ def test_instance_manifest_preserves_declared_access(tmp_path, monkeypatch):
     path = save_instance_manifest(manifest)
     assert path.stat().st_mode & 0o777 == 0o600
     assert load_instance_manifest("dev-vm") == manifest
+
+
+def test_instance_manifest_update_replaces_link_without_truncating_its_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    manifest = Manifest.parse(sample())
+    path = save_instance_manifest(manifest)
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("preserve me")
+    path.unlink()
+    path.hardlink_to(outside)
+    save_instance_manifest(manifest)
+    assert path.stat().st_nlink == 1
+    assert outside.read_text() == "preserve me"
+    assert load_instance_manifest("dev-vm") == manifest
+
+
+def test_audit_rejects_hardlinks_and_history_does_not_follow_symlinks(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    folder = tmp_path / "data" / "isolatevm"
+    folder.mkdir(parents=True)
+    protected = tmp_path / "protected.txt"
+    protected.write_text("preserve me")
+    (folder / "audit.jsonl").hardlink_to(protected)
+    with pytest.raises(ValidationError, match="auditoria inválido"):
+        audit("start", "dev-vm", "ok")
+    assert protected.read_text() == "preserve me"
+    (folder / "audit.jsonl").unlink()
+    (folder / "audit.jsonl").symlink_to(protected)
+    with pytest.raises(ValidationError, match="auditoria inválido"):
+        history()
+    assert protected.read_text() == "preserve me"
+
+
+def test_history_rejects_non_event_json_records(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    folder = tmp_path / "data" / "isolatevm"
+    folder.mkdir(parents=True)
+    (folder / "audit.jsonl").write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+    with pytest.raises(ValidationError, match="Registro do histórico"):
+        history()
 
 
 def test_saved_network_bridge_reads_manifest(tmp_path, monkeypatch):

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            dpkg-dev \
+            gir1.2-adw-1 \
+            gir1.2-gtk-4.0 \
+            python3-gi \
+            python3-pytest \
+            python3-yaml \
+            xvfb
+
+      - name: Compile Python modules
+        run: python3 -m compileall -q isolatevm
+
+      - name: Run unit and GTK smoke tests
+        run: ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q
+
+      - name: Build Ubuntu package
+        run: ./scripts/build-deb.sh
+
+      - name: Inspect package metadata
+        run: dpkg-deb --field dist/isolatevm_0.2.2_all.deb Package Version Architecture

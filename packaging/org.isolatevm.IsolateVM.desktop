@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=IsolateVM
+Comment=Administrador local de Incus VMs
+Exec=isolatevm
+Icon=org.isolatevm.IsolateVM
+Terminal=false
+Categories=System;
+Keywords=Incus;VM;Virtualization;

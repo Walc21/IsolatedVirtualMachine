@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from .model import Manifest, ValidationError
+from .model import Manifest, PROXIED_NETWORK_MODES, ValidationError
 
 
 HELPER = Path("/usr/lib/isolatevm/isolatevm-egress-helper")
@@ -30,9 +30,10 @@ class EgressRuntime:
 
 
 def request_for(manifest: Manifest) -> dict[str, object]:
-    if manifest.networkMode != "restricted" or not manifest.bridge:
-        raise ValidationError("Ação de proxy exige uma rede restricted válida")
+    if manifest.networkMode not in PROXIED_NETWORK_MODES or not manifest.bridge:
+        raise ValidationError("Ação de proxy exige uma rede restricted ou LAN-only válida")
     return {"version": 1, "name": manifest.name, "bridge": manifest.bridge,
+            "network_mode": manifest.networkMode,
             "rules": [{"kind": rule.kind, "value": rule.value, "port": rule.port}
                       for rule in manifest.egress]}
 

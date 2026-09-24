@@ -55,7 +55,7 @@ def load_json() -> dict[str, object]:
         raw = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError) as exc:
         raise Error("pedido JSON inválido") from exc
-    if not isinstance(raw, dict) or raw.get("version") != 1:
+    if not isinstance(raw, dict) or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise Error("versão de pedido inválida")
     return raw
 
@@ -66,7 +66,9 @@ def name(raw: object) -> str:
     return raw
 
 
-def rules(raw: object) -> list[dict[str, object]]:
+def rules(raw: object, network_mode: object) -> list[dict[str, object]]:
+    if not isinstance(network_mode, str) or network_mode not in {"restricted", "lan-only"}:
+        raise Error("modo de rede proxied inválido")
     if not isinstance(raw, list) or not raw or len(raw) > 32:
         raise Error("lista de regras inválida")
     output: list[dict[str, object]] = []
@@ -75,8 +77,11 @@ def rules(raw: object) -> list[dict[str, object]]:
         if not isinstance(item, dict) or set(item) != {"kind", "value", "port"}:
             raise Error("regra de saída inválida")
         kind, value, port = item["kind"], item["value"], item["port"]
-        if kind not in {"domain", "ip", "cidr"} or not isinstance(value, str) or type(port) is not int or not 1 <= port <= 65535:
+        if (not isinstance(kind, str) or kind not in {"domain", "ip", "cidr"} or
+                not isinstance(value, str) or type(port) is not int or not 1 <= port <= 65535):
             raise Error("regra de saída inválida")
+        if network_mode == "lan-only" and kind != "cidr":
+            raise Error("LAN somente aceita CIDRs IPv4 RFC1918")
         if kind == "domain":
             value = value.lower().rstrip(".")
             if not DOMAIN.fullmatch(value): raise Error("domínio inválido")
@@ -86,6 +91,11 @@ def rules(raw: object) -> list[dict[str, object]]:
             except ValueError as exc:
                 raise Error("IP ou CIDR inválido") from exc
             if parsed.version != 4: raise Error("somente IPv4 é suportado")
+            if network_mode == "lan-only":
+                private = tuple(ipaddress.ip_network(value) for value in
+                                ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+                if kind != "cidr" or not any(parsed.subnet_of(network) for network in private):
+                    raise Error("LAN somente aceita CIDRs IPv4 RFC1918")
             value = str(parsed)
         key = (kind, value, port)
         if key in seen: raise Error("regra de saída duplicada")
@@ -246,8 +256,10 @@ def unit(name_value: str, action: str) -> None:
 
 
 def apply(request: dict[str, object], uid: int) -> dict[str, object]:
-    if set(request) != {"version", "name", "bridge", "rules"}: raise Error("campos de pedido inválidos")
-    name_value, bridge, allow = name(request["name"]), request["bridge"], rules(request["rules"])
+    if set(request) != {"version", "name", "bridge", "network_mode", "rules"}: raise Error("campos de pedido inválidos")
+    name_value, bridge = name(request["name"]), request["bridge"]
+    network_mode = request["network_mode"]
+    allow = rules(request["rules"], network_mode)
     if not isinstance(bridge, str) or not NAME.fullmatch(bridge): raise Error("bridge inválida")
     gateway, network = bridge_info(bridge, uid)
     data = state(); existing = data.get(name_value)
@@ -256,7 +268,9 @@ def apply(request: dict[str, object], uid: int) -> dict[str, object]:
     address, port = choose_address(existing, occupied, network)
     mac = mac_for(name_value)
     if existing and existing.get("mac") not in {None, mac}: raise Error("estado de MAC da VM restrita inválido")
-    record: dict[str, object] = {"bridge": bridge, "address": address, "gateway": gateway, "port": port, "mac": mac, "rules": allow}
+    record: dict[str, object] = {"bridge": bridge, "network_mode": network_mode,
+                                 "address": address, "gateway": gateway, "port": port,
+                                 "mac": mac, "rules": allow}
     prepare_logs(name_value)
     write_config(name_value, squid_config(name_value, address, gateway, port, allow))
     unit(name_value, "enable")

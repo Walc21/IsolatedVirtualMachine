@@ -26,8 +26,10 @@ class _UnixHTTP(http.client.HTTPConnection):
 
 class IncusUnixApi:
     ALLOWED = {"/1.0", "/1.0/instances?recursion=2", "/1.0/storage-pools?recursion=1",
-               "/1.0/networks?recursion=1"}
+               "/1.0/networks?recursion=1", "/1.0/resources"}
     INSTANCE_STATE = re.compile(r"/1\.0/instances/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?/state\Z")
+    INSTANCE_SNAPSHOTS = re.compile(
+        r"/1\.0/instances/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?/snapshots\?recursion=1(?:&project=user-[0-9]+)?\Z")
     STORAGE_RESOURCES = re.compile(r"/1\.0/storage-pools/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?/resources\Z")
 
     def __init__(self, socket_path: Path) -> None:
@@ -36,7 +38,9 @@ class IncusUnixApi:
         self.socket_path = socket_path
 
     def get(self, endpoint: str) -> Any:
-        if endpoint not in self.ALLOWED and not self.INSTANCE_STATE.fullmatch(endpoint) and not self.STORAGE_RESOURCES.fullmatch(endpoint):
+        if (endpoint not in self.ALLOWED and not self.INSTANCE_STATE.fullmatch(endpoint)
+                and not self.INSTANCE_SNAPSHOTS.fullmatch(endpoint)
+                and not self.STORAGE_RESOURCES.fullmatch(endpoint)):
             raise ApiError("Endpoint não autorizado pelo adaptador")
         connection = _UnixHTTP(self.socket_path)
         try:

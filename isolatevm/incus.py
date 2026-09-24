@@ -21,13 +21,22 @@ from .api import ApiError, IncusUnixApi
 from .access import local_socket
 from .copy_source import CopySourceError, MAX_COPY_BYTES, MAX_COPY_FILES, open_source_file, scan_source
 from .egress import EgressError, apply as apply_egress, remove as remove_egress
-from .model import INITIAL_SNAPSHOT, Manifest, Mount, ValidationError, _integer, _name
+from .model import (BRIDGED_NETWORK_MODES, PROXIED_NETWORK_MODES, GUEST,
+                    INITIAL_SNAPSHOT, Manifest, Mount, ValidationError, _integer, _name)
 from .metrics import MetricsSnapshot, parse_state
+from .cpu import (CPUSelectionError, cpu_ids as parse_host_cpu_ids,
+                  format_cpu_set, parse_cpu_set)
 from .permissions import NETWORK_SAFE_DEVICE_TYPES, describe_effective
-from .provision import cloud_config
+from .provision import apt_packages, cloud_config
+from .software_catalog import EXTERNAL_TOOL_APT_PACKAGES
+from .software_inventory import (SoftwareInventoryEntry, entries_for, package_name,
+                                 parse_cargo, parse_dpkg, parse_npm, parse_pip,
+                                 parse_pipx, parse_go_modules, parse_rustc,
+                                 unavailable_entries)
 from .storage import data_dir, load_instance_manifest, saved_network_bridge
 from .usb import UsbDevice, host_usb_devices
 from .gpu import GpuDevice, host_gpu_devices
+from .pci import PciDevice, host_pci_devices
 from .workspace_volume import WORKSPACE_DEVICE, volume_name as workspace_volume_name
 
 
@@ -35,6 +44,9 @@ class IncusError(RuntimeError):
     def __init__(self, message: str, technical: str | None = None) -> None:
         super().__init__(message)
         self.technical = technical
+
+
+DATA_DEVICE = re.compile(r"isodata(?:[0-9]|[12][0-9]|3[01])\Z")
 
 
 def _friendly_error(detail: str) -> str:
@@ -52,6 +64,25 @@ def _friendly_error(detail: str) -> str:
     return "A operação Incus falhou. Abra os detalhes técnicos para verificar a causa."
 
 
+def validate_data_volume(pool: str, volume: str, size_gib: int,
+                         guest_path: str, readonly: bool) -> tuple[str, str, int, str, bool]:
+    _name(pool, "Pool")
+    _name(volume, "Volume")
+    _integer(size_gib, 1, 2048, "Tamanho do volume")
+    if type(readonly) is not bool:
+        raise ValidationError("Volume de dados: modo readonly precisa ser booleano")
+    if (not isinstance(guest_path, str) or len(guest_path) > 2048 or
+            not GUEST.fullmatch(guest_path) or guest_path == "/"):
+        raise ValidationError("Volume de dados: informe um caminho absoluto válido dentro do guest")
+    if any(part in {"", ".", ".."} for part in guest_path.split("/")[1:]):
+        raise ValidationError("Volume de dados: pontos e segmentos de caminho vazios não são aceitos")
+    target = Path(guest_path.rstrip("/"))
+    reserved = tuple(Path(item) for item in ("/dev", "/proc", "/sys", "/run", "/boot", "/etc"))
+    if any(target == path or path in target.parents or target in path.parents for path in reserved):
+        raise ValidationError("Volume de dados: escolha um caminho fora de /dev, /proc, /sys, /run, /boot e /etc")
+    return pool, volume, size_gib, str(target), readonly
+
+
 @dataclass(frozen=True)
 class VM:
     name: str
@@ -67,6 +98,7 @@ class VM:
     network_policy: str = "não verificada"
     copy_state: str = "none"
     lifecycle_disposition: str = "persistent"
+    data_volumes: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,6 +106,15 @@ class ProvisioningStatus:
     status: str
     stage: str | None
     error_count: int
+
+
+@dataclass(frozen=True)
+class SnapshotInfo:
+    name: str
+    created_at: str | None
+    description: str | None
+    stateful: bool | None
+    size_bytes: int | None
 
 
 class IncusService(Protocol):
@@ -87,6 +128,7 @@ class IncusService(Protocol):
     def change_state(self, name: str, action: str) -> None: ...
     def delete(self, name: str) -> None: ...
     def snapshots(self, name: str) -> list[str]: ...
+    def snapshot_details(self, name: str) -> list[SnapshotInfo]: ...
     def snapshot(self, name: str, snapshot: str) -> None: ...
     def rename_snapshot(self, name: str, snapshot: str, replacement: str) -> None: ...
     def restore_snapshot(self, name: str, snapshot: str) -> None: ...
@@ -98,15 +140,24 @@ class IncusService(Protocol):
                                  workspace_size_gib: int | None = None) -> bool: ...
     def add_mount(self, name: str, mount: Mount) -> None: ...
     def remove_mount(self, name: str, device: str) -> None: ...
+    def create_data_volume(self, name: str, pool: str, volume: str, size_gib: int,
+                           guest_path: str, readonly: bool = False) -> None: ...
+    def delete_data_volume(self, name: str, device: str) -> None: ...
     def host_usb_devices(self) -> list[UsbDevice]: ...
     def add_usb_device(self, name: str, device: UsbDevice) -> None: ...
     def remove_usb_device(self, name: str, device: str) -> None: ...
     def host_gpu_devices(self) -> list[GpuDevice]: ...
     def add_gpu_device(self, name: str, device: GpuDevice) -> None: ...
     def remove_gpu_device(self, name: str, device: str) -> None: ...
+    def host_pci_devices(self) -> list[PciDevice]: ...
+    def add_pci_device(self, name: str, device: PciDevice) -> None: ...
+    def remove_pci_device(self, name: str, device: str) -> None: ...
     def block_network(self, name: str) -> None: ...
     def restore_network(self, name: str, bridge: str) -> None: ...
     def set_resources(self, name: str, cpu: int, memory_mib: int) -> None: ...
+    def resize_root_disk(self, name: str, size_gib: int) -> None: ...
+    def host_cpu_ids(self) -> tuple[int, ...]: ...
+    def pin_cpus(self, name: str, cpu_spec: str) -> None: ...
     def inject_secrets(self, name: str, retrieve: Callable[[tuple[str, ...]], dict[str, str]]) -> None: ...
     def clear_secrets(self, name: str) -> None: ...
     def apply_copies(self, name: str, progress: Callable[[str], None] | None = None) -> str: ...
@@ -115,8 +166,10 @@ class IncusService(Protocol):
     def console_argv(self, name: str) -> list[str]: ...
     def export_full(self, name: str, destination: Path) -> None: ...
     def export_workspace(self, name: str, destination: Path) -> None: ...
+    def export_data_volume(self, name: str, device: str, destination: Path) -> None: ...
     def metrics(self, name: str) -> MetricsSnapshot: ...
     def provisioning_status(self, name: str) -> ProvisioningStatus: ...
+    def software_inventory(self, name: str) -> list[SoftwareInventoryEntry]: ...
 
 
 class LocalIncus:
@@ -193,6 +246,75 @@ class LocalIncus:
             error_count += sum(len(value) for value in recoverable.values() if isinstance(value, list))
         return ProvisioningStatus(status, stage, error_count)
 
+    def software_inventory(self, name: str) -> list[SoftwareInventoryEntry]:
+        """Read installed versions for the packages selected in this VM's saved manifest."""
+        _name(name, "VM")
+        manifest = load_instance_manifest(name)
+        result: list[SoftwareInventoryEntry] = []
+
+        apt_requested = list(apt_packages(manifest))
+        apt_requested.extend(EXTERNAL_TOOL_APT_PACKAGES[item]
+                             for item in manifest.externalTools)
+        apt_requested = list(dict.fromkeys(apt_requested))
+        if apt_requested:
+            try:
+                output = self._run("exec", name, "--", "dpkg-query", "-W",
+                                   "--showformat=${binary:Package}\\t${Version}\\t${db:Status-Status}\\n",
+                                   timeout=45)
+                if len(output.encode("utf-8", "replace")) > 2_000_000:
+                    raise IncusError("Inventário APT do guest excede o limite de leitura")
+                result.extend(entries_for("apt", apt_requested, parse_dpkg(output)))
+            except (IncusError, ValueError):
+                result.extend(unavailable_entries("apt", apt_requested))
+
+        for manager, requested, command, parser in (
+            ("pip", list(manifest.pip), ("/opt/isolatevm/python/bin/python", "-m", "pip", "list", "--format=json"), parse_pip),
+            ("pipx", list(manifest.pipx), ("/usr/sbin/runuser", "--user", "ubuntu", "--", "pipx", "list", "--skip-maintenance", "--output", "json"), parse_pipx),
+            ("npm", list(manifest.npm),
+             ("/usr/sbin/runuser", "--user", "ubuntu", "--", "/usr/bin/env",
+              "npm_config_prefix=/home/ubuntu/.local", "/usr/bin/npm",
+              "list", "--global", "--depth=0", "--json"), parse_npm),
+            ("cargo", list(manifest.cargo), ("/usr/bin/cargo", "install", "--root", "/usr/local", "--list"), parse_cargo),
+        ):
+            if not requested:
+                continue
+            try:
+                output = self._run("exec", name, "--", *command, timeout=45)
+                if len(output.encode("utf-8", "replace")) > 2_000_000:
+                    raise IncusError(f"Inventário {manager} do guest excede o limite de leitura")
+                result.extend(entries_for(manager, requested, parser(output)))
+            except (IncusError, ValueError):
+                result.extend(unavailable_entries(manager, requested))
+
+        if manifest.go:
+            modules = [package_name(spec, "go") for spec in manifest.go]
+            binaries = list(dict.fromkeys(module.rsplit("/", 1)[-1] for module in modules))
+            try:
+                output = self._run("exec", name, "--", "go", "version", "-m",
+                                   *(f"/usr/local/bin/{binary}" for binary in binaries),
+                                   timeout=45, ok_returncodes=(0, 1))
+                if len(output.encode("utf-8", "replace")) > 2_000_000:
+                    raise IncusError("Inventário Go do guest excede o limite de leitura")
+                versions = parse_go_modules(output, modules)
+                for spec, module in zip(manifest.go, modules):
+                    version = versions.get(module.casefold())
+                    expected = package_name(spec, "go").casefold()
+                    result.append(SoftwareInventoryEntry("go", spec,
+                                                         "installed" if expected in versions else "missing",
+                                                         version))
+            except (IncusError, ValueError):
+                result.extend(unavailable_entries("go", list(manifest.go)))
+        if "rustup" in manifest.apt:
+            try:
+                output = self._run("exec", name, "--", "/usr/sbin/runuser", "--user", "ubuntu", "--",
+                                   "/home/ubuntu/.cargo/bin/rustc", "--version", timeout=30)
+                version = parse_rustc(output)
+                result.append(SoftwareInventoryEntry("rustup", "stable toolchain",
+                                                     "installed" if version else "missing", version))
+            except (IncusError, ValueError):
+                result.append(SoftwareInventoryEntry("rustup", "stable toolchain", "unavailable"))
+        return result
+
     def _json(self, *args: str) -> Any:
         try:
             return json.loads(self._run(*args))
@@ -233,6 +355,10 @@ class LocalIncus:
             if not isinstance(devices, dict): devices = {}
             if not isinstance(state, dict): state = {}
             devices = {key: value for key, value in devices.items() if isinstance(value, dict)}
+            local_devices = row.get("devices") if isinstance(row.get("devices"), dict) else {}
+            local_config = row.get("config") if isinstance(row.get("config"), dict) else {}
+            managed_data = (local_config.get("user.isolatevm.managed") == "true" and
+                            row.get("profiles") == [])
             addresses = state.get("network") or {}
             if not isinstance(addresses, dict): addresses = {}
             ips = [addr.get("address", "") for nic in addresses.values()
@@ -262,7 +388,9 @@ class LocalIncus:
                           str(cfg.get("user.isolatevm.security-profile") or "externo/desconhecido"),
                           network_policy,
                           str(cfg.get("user.isolatevm.copy-state") or "none"),
-                          str(cfg.get("user.isolatevm.lifecycle-disposition") or "persistent")))
+                          str(cfg.get("user.isolatevm.lifecycle-disposition") or "persistent"),
+                          sum(managed_data and DATA_DEVICE.fullmatch(device) is not None and
+                              device in local_devices for device in devices)))
         return out
 
     def pools(self) -> list[str]:
@@ -362,12 +490,20 @@ class LocalIncus:
         self._check_host_mount_policy(manifest.mounts)
         if manifest.pool not in self.pools():
             raise IncusError(f"Pool de armazenamento inexistente: {manifest.pool}")
-        if manifest.networkMode in {"normal", "restricted"} and manifest.bridge not in self.bridges():
+        if manifest.networkMode in BRIDGED_NETWORK_MODES and manifest.bridge not in self.bridges():
             raise IncusError(f"Bridge Incus inexistente: {manifest.bridge}")
         if any(vm.name == manifest.name for vm in self.list_vms()):
             raise IncusError("Já existe uma VM com esse nome")
         # Revalidate paths immediately before the side effect.
         Manifest.parse(manifest.to_dict())
+        if manifest.cpuPinning:
+            try:
+                selected = set(parse_cpu_set(manifest.cpuPinning))
+                available = set(self.host_cpu_ids())
+            except CPUSelectionError as exc:
+                raise IncusError(str(exc)) from None
+            if not selected.issubset(available):
+                raise IncusError("CPU pinning contém IDs que não estão online segundo o Incus")
         return self.image_info(manifest.release)
 
     def create(self, manifest: Manifest, progress: Callable[[str], None] | None = None) -> None:
@@ -379,11 +515,12 @@ class LocalIncus:
             if self._workspace_volume_exists(manifest.pool, workspace_volume):
                 raise IncusError(f"O volume persistente reservado já existe: {workspace_volume}; verifique órfãos antes de reutilizar")
         image = f"images:ubuntu/{manifest.release}/cloud"
+        cpu_setting = manifest.cpuPinning or str(manifest.cpu)
         args = ["create", image, manifest.name, "--vm", "--no-profiles"]
         if workspace_volume is None:
             args += ["-d", "root,type=disk", "-d", "root,path=/",
                      "-d", f"root,pool={manifest.pool}", "-d", f"root,size={manifest.diskGiB}GiB",
-                     "-c", f"limits.cpu={manifest.cpu}", "-c", f"limits.memory={manifest.memoryMiB}MiB",
+                     "-c", f"limits.cpu={cpu_setting}", "-c", f"limits.memory={manifest.memoryMiB}MiB",
                      "-c", "user.isolatevm.managed=true",
                      "-c", f"user.isolatevm.security-profile={manifest.securityProfile}",
                      "-c", f"user.isolatevm.lifecycle-disposition={manifest.lifecycleDisposition}"]
@@ -393,7 +530,7 @@ class LocalIncus:
             for key, value in manifest.environment:
                 args += ["-c", f"environment.{key}={value}"]
         runtime = None
-        if manifest.networkMode == "restricted":
+        if manifest.networkMode in PROXIED_NETWORK_MODES:
             if progress: progress("Autorizando proxy de saída e bloqueio de conexões diretas")
             try:
                 runtime = apply_egress(manifest)
@@ -405,7 +542,7 @@ class LocalIncus:
         create_stdin = None
         if workspace_volume is not None:
             config: dict[str, str] = {
-                "limits.cpu": str(manifest.cpu),
+                "limits.cpu": cpu_setting,
                 "limits.memory": f"{manifest.memoryMiB}MiB",
                 "user.isolatevm.managed": "true",
                 "user.isolatevm.security-profile": manifest.securityProfile,
@@ -459,7 +596,7 @@ class LocalIncus:
                 if progress: progress("Conectando NIC eth0 à bridge autorizada")
                 self._run("config", "device", "add", manifest.name, "eth0", "nic",
                           f"network={manifest.bridge}", "name=eth0", timeout=300)
-            elif manifest.networkMode == "restricted":
+            elif manifest.networkMode in PROXIED_NETWORK_MODES:
                 if progress: progress("Conectando NIC filtrada ao proxy de saída")
                 self._run("config", "device", "add", manifest.name, "eth0", "nic",
                           f"network={manifest.bridge}", "name=eth0", f"ipv4.address={runtime.address}",
@@ -479,19 +616,32 @@ class LocalIncus:
                 try:
                     self._run("delete", manifest.name, "--force", timeout=300)
                 except IncusError as cleanup:
-                    raise IncusError(f"Criação falhou; limpeza manual necessária para {manifest.name}: {cleanup}") from exc
+                    resources = " A política de rede e os volumes associados foram preservados para não remover recursos de uma VM cujo estado é incerto." if runtime is not None or created_workspace else ""
+                    raise IncusError(f"Criação falhou; limpeza manual necessária para {manifest.name}: {cleanup}.{resources}") from exc
+            elif runtime is not None or created_workspace:
+                try:
+                    remains = any(vm.name == manifest.name for vm in self.list_vms())
+                except Exception as inspect_error:
+                    raise IncusError(f"Criação de {manifest.name} não foi confirmada; política de rede/volume preservada até revisar a VM: {inspect_error}",
+                                     str(exc)) from exc
+                if remains:
+                    raise IncusError(f"Criação de {manifest.name} ficou incerta e uma VM com esse nome existe; política de rede e volume preservados para revisão.",
+                                     str(exc)) from exc
+            cleanup_errors: list[str] = []
             if created_workspace and workspace_volume is not None:
                 try:
                     self._verify_workspace_volume(manifest.pool, workspace_volume,
                                                   manifest.name, manifest.workspaceSizeGiB)
                     self._run("storage", "volume", "delete", manifest.pool, workspace_volume, timeout=300)
                 except Exception as cleanup:
-                    raise IncusError(f"Criação falhou; volume /workspace preservado ou limpeza pendente: {workspace_volume} ({cleanup})") from exc
+                    cleanup_errors.append(f"volume /workspace {workspace_volume}: {cleanup}")
             if runtime is not None:
                 try:
                     remove_egress(manifest.name)
-                except EgressError:
-                    pass
+                except EgressError as cleanup:
+                    cleanup_errors.append(f"política de rede {manifest.name}: {cleanup}")
+            if cleanup_errors:
+                raise IncusError(f"Criação falhou; recursos preservados ou limpeza pendente: {'; '.join(cleanup_errors)}") from exc
             if created:
                 raise
             raise IncusError(f"Criação de {manifest.name} não foi confirmada. Atualize a lista Incus antes de tentar novamente.",
@@ -728,20 +878,130 @@ class LocalIncus:
         self._verify_workspace_volume(actual_pool, volume, name, size_gib)
         return actual_pool, volume
 
+    def _verify_data_volume(self, pool: str, volume: str, owner: str,
+                            size_gib: int | None = None) -> dict[str, Any]:
+        raw = self._verify_workspace_volume(pool, volume, owner, size_gib)
+        config = raw["config"]
+        if config.get("user.isolatevm.kind") != "data":
+            raise IncusError(f"Volume não marcado como disco de dados IsolateVM: {volume}")
+        return raw
+
+    def create_data_volume(self, name: str, pool: str, volume: str, size_gib: int,
+                           guest_path: str, readonly: bool = False) -> None:
+        _name(name, "VM")
+        pool, volume, size_gib, guest_path, readonly = validate_data_volume(
+            pool, volume, size_gib, guest_path, readonly)
+        self._require_stopped_vm(name)
+        if pool not in self.pools():
+            raise ValidationError(f"Pool de armazenamento inexistente: {pool}")
+        devices = self._local_devices(name)
+        effective = self.effective(name)
+        target_path = Path(guest_path)
+        for current in effective.get("mounts", []) + effective.get("volumes", []):
+            current_path = current.get("path")
+            if not isinstance(current_path, str) or not current_path.startswith("/"):
+                continue
+            path = Path(current_path)
+            if target_path == path or target_path in path.parents or path in target_path.parents:
+                raise ValidationError(f"Volume de dados: destino {guest_path} se sobrepõe a {current_path}")
+        device = next((f"isodata{index}" for index in range(32)
+                       if f"isodata{index}" not in devices), None)
+        if device is None:
+            raise IncusError("Limite de 32 discos de dados gerenciados alcançado")
+        if self._workspace_volume_exists(pool, volume):
+            raise IncusError(f"O volume já existe e não será reutilizado: {pool}/{volume}")
+        self._run("storage", "volume", "create", pool, volume,
+                  f"size={size_gib}GiB", "user.isolatevm.managed=true",
+                  f"user.isolatevm.owner={name}", f"user.isolatevm.size-gib={size_gib}",
+                  "user.isolatevm.kind=data", timeout=600)
+        self._verify_data_volume(pool, volume, name, size_gib)
+        try:
+            self._run("config", "device", "add", name, device, "disk",
+                      f"pool={pool}", f"source={volume}", f"path={guest_path}",
+                      f"readonly={'true' if readonly else 'false'}", timeout=300)
+        except Exception as exc:
+            try:
+                attached = self._local_devices(name).get(device)
+            except Exception as inspect_error:
+                raise IncusError(f"Anexação do volume não foi confirmada; o volume {pool}/{volume} foi preservado para revisão",
+                                 str(inspect_error)) from exc
+            if (isinstance(attached, dict) and attached.get("type") == "disk" and
+                    attached.get("pool") == pool and attached.get("source") == volume):
+                raise IncusError(f"A anexação pode ter sido concluída; o volume {pool}/{volume} foi preservado para revisão",
+                                 str(exc)) from exc
+            try:
+                self._verify_data_volume(pool, volume, name, size_gib)
+                self._run("storage", "volume", "delete", pool, volume, timeout=300)
+            except Exception as cleanup:
+                raise IncusError(f"Falha ao anexar; o volume {pool}/{volume} foi preservado e exige revisão",
+                                 str(cleanup)) from exc
+            raise IncusError("Falha ao anexar o disco de dados; o volume incompleto foi removido",
+                             str(exc)) from exc
+
+    def delete_data_volume(self, name: str, device: str) -> None:
+        _name(name, "VM")
+        if not isinstance(device, str) or not DATA_DEVICE.fullmatch(device):
+            raise ValidationError("Somente discos de dados gerenciados podem ser excluídos")
+        self._require_stopped_vm(name)
+        raw = self._local_devices(name).get(device)
+        if not isinstance(raw, dict) or raw.get("type") != "disk" or raw.get("path") == "/":
+            raise ValidationError("Disco de dados gerenciado não encontrado")
+        pool, volume = raw.get("pool"), raw.get("source")
+        if not isinstance(pool, str) or not isinstance(volume, str):
+            raise IncusError("Pool ou nome do volume não pôde ser confirmado")
+        info = self._verify_data_volume(pool, volume, name)
+        size_marker = info["config"].get("user.isolatevm.size-gib")
+        if not isinstance(size_marker, str) or not size_marker.isdigit():
+            raise IncusError(f"Tamanho do volume não pôde ser confirmado: {volume}")
+        self._verify_data_volume(pool, volume, name, int(size_marker))
+        self._run("config", "device", "remove", name, device, timeout=300)
+        try:
+            remaining = self._local_devices(name).get(device)
+        except Exception as exc:
+            raise IncusError(f"Disco removido da solicitação, mas o volume {pool}/{volume} foi preservado; confirme o estado da VM antes de excluir dados",
+                             str(exc)) from exc
+        if remaining is not None:
+            raise IncusError(f"Disco continua anexado; volume {pool}/{volume} foi preservado")
+        self._run("storage", "volume", "delete", pool, volume, timeout=300)
+
     def delete(self, name: str) -> None:
         _name(name, "VM")
         restricted = self._security_profile(name) == "restricted-development"
         local = self._local_instance_config(name)
         settings = local.get("config") if isinstance(local.get("config"), dict) else {}
+        managed = settings.get("user.isolatevm.managed") == "true" and local.get("profiles") == []
         disposition = settings.get("user.isolatevm.lifecycle-disposition")
         workspace_marker = settings.get("user.isolatevm.workspace-volume")
         workspace: tuple[str, str] | None = None
         if disposition == "persist-workspace" or workspace_marker is not None:
-            if (settings.get("user.isolatevm.managed") != "true" or
-                    disposition != "persist-workspace" or local.get("profiles") != []):
+            if (not managed or disposition != "persist-workspace"):
                 raise IncusError(f"Propriedade da VM/volume /workspace não pôde ser confirmada: {name}; nada foi excluído")
             workspace = self._verify_workspace_device(name, local)
+        devices = local.get("devices") if isinstance(local.get("devices"), dict) else {}
+        data_volumes: list[tuple[str, str]] = []
+        if any(DATA_DEVICE.fullmatch(device) for device in devices) and not managed:
+            raise IncusError(f"Propriedade da VM não pôde ser confirmada: {name}; nada foi excluído")
+        for device, raw in devices.items():
+            if not DATA_DEVICE.fullmatch(device):
+                continue
+            if (not isinstance(raw, dict) or raw.get("type") != "disk" or
+                    raw.get("path") in {None, "/"} or
+                    not isinstance(raw.get("pool"), str) or
+                    not isinstance(raw.get("source"), str)):
+                raise IncusError(f"Disco de dados não pôde ser confirmado: {name}/{device}; nada foi excluído")
+            pool, volume = raw["pool"], raw["source"]
+            info = self._verify_data_volume(pool, volume, name)
+            size_marker = info["config"].get("user.isolatevm.size-gib")
+            if not isinstance(size_marker, str) or not size_marker.isdigit():
+                raise IncusError(f"Tamanho do disco de dados não pôde ser confirmado: {pool}/{volume}; nada foi excluído")
+            self._verify_data_volume(pool, volume, name, int(size_marker))
+            data_volumes.append((pool, volume))
         self._run("delete", name, "--force", timeout=300)
+        for pool, volume in data_volumes:
+            try:
+                self._run("storage", "volume", "delete", pool, volume, timeout=300)
+            except IncusError as exc:
+                raise IncusError(f"VM removida, mas o disco de dados {pool}/{volume} continua preservado; revise ou remova esse volume manualmente: {exc}") from exc
         if workspace is not None:
             pool, volume = workspace
             try:
@@ -761,6 +1021,38 @@ class LocalIncus:
         if not isinstance(rows, list):
             raise IncusError("Lista de snapshots inválida recebida do Incus")
         return [unquote(urlsplit(x).path.rsplit("/", 1)[-1]) for x in rows if isinstance(x, str)]
+
+    def snapshot_details(self, name: str) -> list[SnapshotInfo]:
+        _name(name, "VM")
+        endpoint = f"/1.0/instances/{name}/snapshots?recursion=1"
+        if getattr(self, "access_mode", "admin") == "confined":
+            endpoint += f"&project=user-{os.geteuid()}"
+        result = self._read(endpoint, "query", endpoint)
+        rows = result.get("metadata", result) if isinstance(result, dict) else result
+        if not isinstance(rows, list):
+            raise IncusError("Metadados de snapshots inválidos recebidos do Incus")
+        snapshots: list[SnapshotInfo] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            snapshot_name = row.get("name")
+            if not isinstance(snapshot_name, str):
+                url = row.get("url")
+                snapshot_name = (unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+                                 if isinstance(url, str) else None)
+            if not isinstance(snapshot_name, str) or not snapshot_name:
+                continue
+            created = row.get("created_at")
+            description = row.get("description")
+            stateful = row.get("stateful")
+            size = row.get("size")
+            snapshots.append(SnapshotInfo(
+                snapshot_name,
+                created if isinstance(created, str) and created else None,
+                description if isinstance(description, str) and description else None,
+                stateful if type(stateful) is bool else None,
+                size if type(size) is int and size >= 0 else None))
+        return snapshots
 
     def snapshot(self, name: str, snapshot: str) -> None:
         _name(name, "VM")
@@ -798,11 +1090,30 @@ class LocalIncus:
         source_disposition = source_settings.get("user.isolatevm.lifecycle-disposition")
         workspace: tuple[str, str, int] | None = None
         target_volume: str | None = None
+        data_volumes: list[tuple[str, str, str, int]] = []
+        target_data_volumes: list[tuple[str, str, str, int]] = []
+        source_vm = next((vm for vm in vms if vm.name == source), None)
+        source_devices = source_local.get("devices") if isinstance(source_local.get("devices"), dict) else {}
+        for device, raw in source_devices.items():
+            if not DATA_DEVICE.fullmatch(device):
+                continue
+            if (not isinstance(raw, dict) or raw.get("type") != "disk" or
+                    raw.get("path") in {None, "/"} or
+                    not isinstance(raw.get("pool"), str) or
+                    not isinstance(raw.get("source"), str)):
+                raise IncusError(f"Disco de dados de origem não pôde ser confirmado: {source}/{device}")
+            pool, volume = raw["pool"], raw["source"]
+            info = self._verify_data_volume(pool, volume, source)
+            size_marker = info["config"].get("user.isolatevm.size-gib")
+            if not isinstance(size_marker, str) or not size_marker.isdigit():
+                raise IncusError(f"Tamanho do disco de dados de origem não pôde ser confirmado: {pool}/{volume}")
+            size_gib = int(size_marker)
+            self._verify_data_volume(pool, volume, source, size_gib)
+            data_volumes.append((pool, device, volume, size_gib))
+        if data_volumes and (source_vm is None or source_vm.status != "Stopped"):
+            raise IncusError("Pare a VM antes de clonar discos de dados para manter os arquivos consistentes")
         if source_disposition == "persist-workspace":
-            source_vm = next((vm for vm in vms if vm.name == source), None)
-            if source_vm is None:
-                raise IncusError(f"VM de origem não encontrada: {source}")
-            if source_vm.status != "Stopped":
+            if source_vm is None or source_vm.status != "Stopped":
                 raise IncusError("Pare a VM antes de clonar /workspace para manter os dados consistentes")
             pool, source_volume = self._verify_workspace_device(source, source_local)
             volume_data = self._verify_workspace_volume(pool, source_volume, source)
@@ -826,9 +1137,23 @@ class LocalIncus:
                 volume_created = True
                 self._run("storage", "volume", "set", pool, target_volume,
                           f"user.isolatevm.owner={target}", timeout=300)
+            for pool, device, source_data_volume, size_gib in data_volumes:
+                copied_volume = f"{target[:45]}-{device}"
+                if self._workspace_volume_exists(pool, copied_volume):
+                    raise IncusError(f"O volume do clone já existe: {pool}/{copied_volume}; verifique órfãos antes de reutilizar")
+                target_data_volumes.append((pool, device, copied_volume, size_gib))
+                self._run("storage", "volume", "copy", f"{pool}/{source_data_volume}",
+                          f"{pool}/{copied_volume}", "--volume-only", timeout=1200)
+                self._run("storage", "volume", "set", pool, copied_volume,
+                          f"user.isolatevm.owner={target}", timeout=300)
+                self._verify_data_volume(pool, copied_volume, target, size_gib)
             self._run("copy", source, target,
-                      *( ["--instance-only"] if workspace is not None else [] ), timeout=1200)
+                      *( ["--instance-only"] if workspace is not None or data_volumes else [] ), timeout=1200)
             instance_created = True
+            for pool, device, copied_volume, _size_gib in target_data_volumes:
+                self._run("config", "device", "set", target, device,
+                          f"source={copied_volume}", timeout=300)
+                self._verify_data_volume(pool, copied_volume, target, _size_gib)
             if workspace is not None and target_volume is not None:
                 pool, _source_volume, size_gib = workspace
                 self._run("config", "device", "set", target, WORKSPACE_DEVICE,
@@ -844,6 +1169,11 @@ class LocalIncus:
                 self._run("config", "set", target, "user.isolatevm.lifecycle-disposition=persistent")
         except Exception as exc:
             cleanup_errors: list[str] = []
+            if not instance_created:
+                try:
+                    instance_created = any(vm.name == target for vm in self.list_vms())
+                except Exception as inspect_error:
+                    cleanup_errors.append(f"estado da VM {target} não confirmado: {inspect_error}")
             if instance_created:
                 try: self._run("delete", target, "--force", timeout=300)
                 except IncusError as cleanup: cleanup_errors.append(f"VM {target}: {cleanup}")
@@ -857,6 +1187,14 @@ class LocalIncus:
                                                       source, workspace[2])
                     self._run("storage", "volume", "delete", workspace[0], target_volume, timeout=300)
                 except Exception as cleanup: cleanup_errors.append(f"volume {target_volume}: {cleanup}")
+            for pool, _device, copied_volume, size_gib in target_data_volumes:
+                try:
+                    if not self._workspace_volume_exists(pool, copied_volume):
+                        continue
+                    self._verify_data_volume(pool, copied_volume, target, size_gib)
+                    self._run("storage", "volume", "delete", pool, copied_volume, timeout=300)
+                except Exception as cleanup:
+                    cleanup_errors.append(f"volume {copied_volume}: {cleanup}")
             if cleanup_errors:
                 raise IncusError(f"Clone falhou; a limpeza falhou e exige revisão: {'; '.join(cleanup_errors)}") from exc
             raise
@@ -868,6 +1206,19 @@ class LocalIncus:
         if not isinstance(config, dict):
             raise IncusError("Configuração efetiva inválida")
         summary = describe_effective(config, local if isinstance(local, dict) else {})
+        raw_devices = config.get("devices") if isinstance(config.get("devices"), dict) else {}
+        for item in summary["volumes"]:
+            device = item.get("device")
+            raw = raw_devices.get(device) if isinstance(device, str) else None
+            if not item.get("managed") or not isinstance(raw, dict):
+                continue
+            pool, volume = raw.get("pool"), raw.get("source")
+            try:
+                info = self._verify_data_volume(pool, volume, name)
+                size = info["config"].get("user.isolatevm.size-gib")
+                item["size"] = f"{size} GiB" if isinstance(size, str) and size.isdigit() else "não verificado"
+            except (IncusError, ValidationError):
+                item["size"] = "não verificado"
         summary["config"] = _redact_config(config)
         return summary
 
@@ -971,6 +1322,7 @@ class LocalIncus:
         if self._security_profile(name) == "maximum-isolation": raise ValidationError("Máximo isolamento impede repassar GPU")
         if not isinstance(device, GpuDevice) or not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", device.pci) or not re.fullmatch(r"[0-9a-f]{4}", device.vendor_id) or not re.fullmatch(r"[0-9a-f]{4}", device.product_id):
             raise ValidationError("GPU inválida")
+        self._require_stopped_vm(name)
         current = self._local_devices(name); used = set(current)
         slot = next((f"isogpu{i}" for i in range(8) if f"isogpu{i}" not in used), None)
         if slot is None: raise IncusError("Limite de GPUs gerenciadas alcançado")
@@ -980,9 +1332,56 @@ class LocalIncus:
     def remove_gpu_device(self, name: str, device: str) -> None:
         _name(name, "VM")
         if not re.fullmatch(r"isogpu[0-7]", device): raise ValidationError("Somente GPUs gerenciadas podem ser removidas")
+        self._require_stopped_vm(name)
         raw = self._local_devices(name).get(device)
         if not isinstance(raw, dict) or raw.get("type") != "gpu": raise ValidationError("GPU gerenciada não encontrada")
         self._run("config", "device", "remove", name, device, timeout=300)
+
+    def host_pci_devices(self) -> list[PciDevice]: return host_pci_devices()
+
+    def add_pci_device(self, name: str, device: PciDevice) -> None:
+        _name(name, "VM")
+        if self._security_profile(name) == "maximum-isolation":
+            raise ValidationError("Máximo isolamento impede repassar dispositivos PCI")
+        if not isinstance(device, PciDevice):
+            raise ValidationError("Dispositivo PCI inválido")
+        address_pattern = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}[.][0-7]"
+        if (not re.fullmatch(address_pattern, device.address) or
+                not re.fullmatch(r"[0-9a-f]{4}", device.vendor_id) or
+                not re.fullmatch(r"[0-9a-f]{4}", device.product_id) or
+                not re.fullmatch(r"[0-9a-f]{6}", device.class_code) or
+                not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}|sem driver|driver desconhecido", device.driver)):
+            raise ValidationError("Dispositivo PCI inválido")
+        self._require_stopped_vm(name)
+        current = self._local_devices(name)
+        if any(raw.get("type") == "pci" and raw.get("address") == device.address
+               for raw in current.values() if isinstance(raw, dict)):
+            raise ValidationError("Esse endereço PCI já está atribuído à VM")
+        observed = next((item for item in host_pci_devices() if item.address == device.address), None)
+        if observed != device:
+            raise ValidationError("Dispositivo PCI mudou desde a seleção; atualize a lista e revise novamente")
+        slot = next((f"isopci{i}" for i in range(8) if f"isopci{i}" not in current), None)
+        if slot is None:
+            raise IncusError("Limite de dispositivos PCI gerenciados alcançado")
+        self._run("config", "device", "add", name, slot, "pci",
+                  f"address={device.address}", "firmware=false", timeout=300)
+
+    def remove_pci_device(self, name: str, device: str) -> None:
+        _name(name, "VM")
+        if not re.fullmatch(r"isopci[0-7]", device):
+            raise ValidationError("Somente dispositivos PCI gerenciados podem ser removidos")
+        self._require_stopped_vm(name)
+        raw = self._local_devices(name).get(device)
+        if not isinstance(raw, dict) or raw.get("type") != "pci":
+            raise ValidationError("Dispositivo PCI gerenciado não encontrado")
+        self._run("config", "device", "remove", name, device, timeout=300)
+
+    def _require_stopped_vm(self, name: str) -> None:
+        vm = next((item for item in self.list_vms() if item.name == name), None)
+        if vm is None:
+            raise IncusError(f"VM não encontrada: {name}")
+        if vm.status != "Stopped":
+            raise ValidationError("Desligue a VM antes desta alteração; Incus não aceita esta operação enquanto ela está ligada")
 
     def _local_devices(self, name: str) -> dict[str, Any]:
         _name(name, "VM")
@@ -1040,7 +1439,7 @@ class LocalIncus:
                 manifest = load_instance_manifest(name)
             except ValidationError as exc:
                 raise IncusError("Manifesto restrito original indisponível; restauração automática recusada") from exc
-            if manifest.networkMode != "restricted" or manifest.bridge != bridge:
+            if manifest.networkMode not in PROXIED_NETWORK_MODES or manifest.bridge != bridge:
                 raise IncusError("Manifesto não corresponde à política restrita salva")
             try:
                 runtime = apply_egress(manifest)
@@ -1059,10 +1458,67 @@ class LocalIncus:
         _integer(memory_mib, 512, 262144, "RAM")
         self._run("config", "set", name, f"limits.cpu={cpu}", f"limits.memory={memory_mib}MiB", timeout=300)
 
+    def resize_root_disk(self, name: str, size_gib: int) -> None:
+        _name(name, "VM")
+        _integer(size_gib, 8, 2048, "Disco")
+        self._require_stopped_vm(name)
+        devices = self._local_devices(name)
+        root = devices.get("root")
+        if not isinstance(root, dict) or root.get("type") != "disk" or root.get("path") != "/":
+            raise ValidationError("Disco raiz local não foi verificado; alteração indisponível")
+        current = root.get("size")
+        match = re.fullmatch(r"([1-9][0-9]{0,3})GiB", current) if isinstance(current, str) else None
+        if match is None:
+            raise ValidationError("Tamanho atual do disco raiz não está em GiB inteiros")
+        if size_gib <= int(match.group(1)):
+            raise ValidationError("O disco pode apenas ser aumentado e o novo tamanho deve ser maior")
+        self._run("config", "device", "set", name, "root", f"size={size_gib}GiB", timeout=300)
+
+    def host_cpu_ids(self) -> tuple[int, ...]:
+        self._require_connection_approval()
+        data = self._read("/1.0/resources", "info", "--resources", "--format=json")
+        try:
+            ids = parse_host_cpu_ids(data)
+        except CPUSelectionError as exc:
+            raise IncusError(str(exc)) from None
+        if not ids:
+            raise IncusError("Incus não informou CPUs online para pinning")
+        return ids
+
+    def pin_cpus(self, name: str, cpu_spec: str) -> None:
+        _name(name, "VM")
+        self._require_stopped_vm(name)
+        try:
+            selected = parse_cpu_set(cpu_spec)
+            normalized = format_cpu_set(selected)
+        except CPUSelectionError as exc:
+            raise ValidationError(str(exc)) from None
+        available = set(self.host_cpu_ids())
+        if not set(selected).issubset(available):
+            raise ValidationError("CPU pinning contém IDs que não estão online segundo o Incus")
+        self._local_devices(name)  # Refuse unmanaged instances and inherited profiles.
+        local = self._local_instance_config(name)
+        settings = local.get("config")
+        if not isinstance(settings, dict) or not isinstance(settings.get("limits.cpu"), str):
+            raise IncusError("Quantidade/seleção atual de CPU não pôde ser verificada")
+        if settings["limits.cpu"] == normalized:
+            raise ValidationError("A VM já usa esse pinning de CPU")
+        self._run("config", "set", name, f"limits.cpu={normalized}", timeout=300)
+
     def terminal_argv(self, name: str) -> list[str]:
         self._require_connection_approval()
         _name(name, "VM")
-        return [self.binary, "--force-local", "exec", name, "--", "/bin/bash"]
+        return [self.binary, "--force-local", "exec", name, "--force-interactive",
+                "--", "/bin/bash", "-l"]
+
+    def terminal_environment(self) -> dict[str, str]:
+        """Give the interactive Incus client only the host context it needs."""
+        return {
+            "HOME": str(Path.home()),
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "INCUS_CONF": str(self.client_config_dir),
+        }
 
     def guest_login_argv(self, name: str) -> list[str]:
         self._require_connection_approval()
@@ -1132,6 +1588,43 @@ class LocalIncus:
             raise ValidationError("Exportação de /workspace: destino criado por outro processo; escolha outro nome") from exc
         except OSError as exc:
             raise IncusError("Não foi possível gravar a exportação de /workspace", str(exc)) from exc
+
+    def export_data_volume(self, name: str, device: str, destination: Path) -> None:
+        _name(name, "VM")
+        if not isinstance(device, str) or not DATA_DEVICE.fullmatch(device):
+            raise ValidationError("Somente discos de dados gerenciados podem ser exportados")
+        self._require_stopped_vm(name)
+        raw = self._local_devices(name).get(device)
+        if (not isinstance(raw, dict) or raw.get("type") != "disk" or
+                raw.get("path") in {None, "/"} or not isinstance(raw.get("pool"), str) or
+                not isinstance(raw.get("source"), str)):
+            raise ValidationError("Disco de dados gerenciado não encontrado")
+        pool, volume = raw["pool"], raw["source"]
+        info = self._verify_data_volume(pool, volume, name)
+        size_marker = info["config"].get("user.isolatevm.size-gib")
+        if not isinstance(size_marker, str) or not size_marker.isdigit():
+            raise IncusError(f"Tamanho do disco de dados não pôde ser confirmado: {pool}/{volume}")
+        self._verify_data_volume(pool, volume, name, int(size_marker))
+        if not destination.is_absolute() or not destination.name.endswith(".tar.gz"):
+            raise ValidationError("Backup do disco: escolha um destino absoluto terminado em .tar.gz")
+        try:
+            parent = destination.parent.resolve(strict=True)
+            if not parent.is_dir():
+                raise ValidationError("Backup do disco: pasta de destino inválida")
+            target = parent / destination.name
+            if target.exists() or target.is_symlink():
+                raise ValidationError("Backup do disco: destino já existe; escolha outro nome")
+            with tempfile.TemporaryDirectory(prefix=".isolatevm-disk-", dir=parent) as stage:
+                temporary = Path(stage) / f"{name}-{device}.tar.gz"
+                self._run("storage", "volume", "export", pool, volume, str(temporary), timeout=7200)
+                if not temporary.is_file() or temporary.is_symlink():
+                    raise IncusError("O Incus não produziu um arquivo de backup válido para o disco de dados")
+                os.chmod(temporary, 0o600)
+                os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ValidationError("Backup do disco: destino criado por outro processo; escolha outro nome") from exc
+        except OSError as exc:
+            raise IncusError("Não foi possível gravar o backup do disco de dados", str(exc)) from exc
 
     def metrics(self, name: str) -> MetricsSnapshot:
         _name(name, "VM")

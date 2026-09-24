@@ -28,6 +28,20 @@ def test_round_trip_and_defaults():
     assert Manifest.from_yaml(manifest.to_yaml()) == manifest
 
 
+def test_cpu_pinning_manifest_is_canonical_and_round_trips():
+    raw = sample()
+    raw["metadata"] = {"cpuPinning": "6,0"}
+    manifest = Manifest.parse(raw)
+    assert manifest.cpuPinning == "0-0,6-6"
+    assert manifest.to_dict()["metadata"]["cpuPinning"] == "0-0,6-6"
+    assert "CPUs do host fixadas: 0-0,6-6" in manifest.review()
+    assert Manifest.from_yaml(manifest.to_yaml()) == manifest
+
+    raw["metadata"]["cpuPinning"] = "0-2"
+    with pytest.raises(ValidationError, match="quantidade de IDs"):
+        Manifest.parse(raw)
+
+
 def test_pipx_applications_round_trip_with_pins():
     manifest = Manifest.parse(sample(software={"apt": [], "pipx": ["uv==0.12.18", "poetry==2.5.1"]}))
     assert manifest.pipx == ("uv==0.12.18", "poetry==2.5.1")
@@ -37,6 +51,22 @@ def test_pipx_applications_round_trip_with_pins():
     for bad in (["--index-url=https://example.test"], ["uv;touch /tmp/pwn"]):
         with pytest.raises(ValidationError, match="pipx"):
             Manifest.parse(sample(software={"apt": [], "pipx": bad}))
+
+
+def test_ai_coding_tools_use_validated_package_managers_and_supported_aider_python():
+    manifest = Manifest.parse(sample(software={
+        "apt": [],
+        "pipx": ["aider-chat==0.86.2"],
+        "npm": ["@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"],
+    }))
+    assert Manifest.from_yaml(manifest.to_yaml()) == manifest
+    assert manifest.to_dict()["software"]["pipx"] == ["aider-chat==0.86.2"]
+    assert manifest.to_dict()["software"]["npm"] == [
+        "@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"]
+
+    with pytest.raises(ValidationError, match="Aider 0.86.2 requer Python"):
+        Manifest.parse(sample(os={"distribution": "ubuntu", "release": "26.04"},
+                              software={"apt": [], "pipx": ["aider-chat==0.86.2"]}))
 
 
 def test_devops_upstream_choices_round_trip_and_reject_unknown_sources():
@@ -124,7 +154,7 @@ def test_maximum_isolation_is_enforced_by_manifest(tmp_path, monkeypatch):
     with pytest.raises(ValidationError, match="Máximo isolamento"):
         Manifest.parse(sample(security={"profile": "maximum-isolation"},
                               mounts=[{"host": str(folder), "guest": "/workspace", "mode": "ro"}]))
-    with pytest.raises(ValidationError, match="rede restricted"):
+    with pytest.raises(ValidationError, match="Desenvolvimento restrito"):
         Manifest.parse(sample(security={"profile": "restricted-development"}))
 
 
@@ -140,6 +170,23 @@ def test_restricted_egress_is_explicit_and_round_trips():
     raw["network"]["egress"] = []
     with pytest.raises(ValidationError, match="ao menos"):
         Manifest.parse(raw)
+
+
+def test_lan_only_requires_private_ipv4_cidrs_and_restricted_profile():
+    raw = sample(network={"mode": "lan-only", "bridge": "incusbr0", "egress": [
+        {"kind": "cidr", "value": "192.168.1.0/24", "port": 5432}]},
+        security={"profile": "restricted-development"})
+    manifest = Manifest.parse(raw)
+    assert manifest.networkMode == "lan-only"
+    assert Manifest.from_yaml(manifest.to_yaml()) == manifest
+    with pytest.raises(ValidationError, match="CIDRs dentro"):
+        Manifest.parse(sample(network={"mode": "lan-only", "bridge": "incusbr0", "egress": [
+            {"kind": "cidr", "value": "8.8.8.0/24", "port": 443}]},
+            security={"profile": "restricted-development"}))
+    with pytest.raises(ValidationError, match="restricted-development"):
+        Manifest.parse(sample(network={"mode": "lan-only", "bridge": "incusbr0", "egress": [
+            {"kind": "cidr", "value": "192.168.1.0/24", "port": 5432}]},
+            security={"profile": "normal-development"}))
 
 
 def test_environment_is_reproducible_and_rejects_secrets():
@@ -221,11 +268,14 @@ def test_template_drops_personal_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     project = tmp_path / "project"; project.mkdir()
-    manifest = Manifest.parse(sample(mounts=[{"host": str(project), "guest": "/workspace", "mode": "rw"}]))
+    manifest = Manifest.parse(sample(
+        mounts=[{"host": str(project), "guest": "/workspace", "mode": "rw"}],
+        metadata={"cpuPinning": "0-1"}))
     path = save_template("safe-dev", manifest)
     assert path.stat().st_mode & 0o777 == 0o600
     assert str(project) not in path.read_text()
     assert not load_template("safe-dev").mounts
+    assert load_template("safe-dev").cpuPinning == "0-1"
     with pytest.raises(ValidationError, match="já existe"):
         save_template("safe-dev", manifest)
     first = save_template_versioned("safe-dev", manifest)

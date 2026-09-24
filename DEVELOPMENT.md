@@ -6,6 +6,12 @@ Para verificar a cópia única sem dados pessoais: `python3 -m pytest -q tests/t
 
 `tests/test_model.py` cobre exportação create-only, versões numeradas e round-trip de importação sem conexão Incus.
 
+`tests/test_software_inventory.py` cobre os parsers de APT, pip, pipx, npm, Cargo, Go e Rust, estados ausentes/divergentes e que a consulta real usa apenas comandos separados e validados. A verificação do guest só percorre pacotes do manifesto local de uma VM IsolateVM em execução.
+
+`tests/test_incus.py` verifica o argv fechado do terminal Incus e que o cliente interativo recebe ambiente mínimo, sem variáveis secretas do host. Os testes GTK confirmam que o modo mock não abre um processo de terminal.
+
+Com acesso deliberado ao projeto Incus restrito e a imagem Ubuntu 24.04 em cache, `sg incus -c 'PYTHONPATH=. python3 scripts/live-software-inventory-smoke.py'` cria uma VM offline descartável, consulta APT sem instalar pacotes e remove a VM ao sair. Esse smoke não valida inventário real dos demais gerenciadores.
+
 `tests/test_change_diff.py` cobre as prévias de recursos, mounts, rede e dispositivos. O smoke GTK verifica os botões Cancelar/Aplicar e recusa uma prévia obsoleta. O script `live-protection-snapshot-smoke.py` também confere o diff de CPU/RAM contra uma configuração Incus real, usando uma imagem Ubuntu 24.04 já presente no cache local.
 
 O smoke GTK `test_disposable_close_requires_confirmation_and_deletes_only_after_apply` percorre o fluxo de fechamento com serviço simulado: cancelar mantém a VM; confirmar remove VM, manifesto local e registra a auditoria. O teste também aciona o handler de fechamento usando um adapter confinado simulado.
@@ -14,7 +20,7 @@ O smoke GTK `test_disposable_close_requires_confirmation_and_deletes_only_after_
 
 ```bash
 sudo apt install python3 python3-gi python3-yaml \
-  gir1.2-gtk-4.0 gir1.2-adw-1 python3-pytest python3-secretstorage
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 python3-pytest python3-secretstorage
 ```
 
 Para os testes gráficos em um ambiente sem sessão de desktop, instale `xvfb` e execute `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`. A suíte padrão usa mocks e não precisa de daemon Incus.

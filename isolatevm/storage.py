@@ -21,7 +21,7 @@ def data_dir() -> Path:
 
 
 def audit(action: str, vm: str, result: str, source: str = "gui") -> None:
-    if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "network-block", "network-restore", "resources", "clone", "template", "export", "backup-full", "backup-workspace", "secret-store", "secret-delete", "secret-inject", "secret-clear", "copy-files", "disposable-retain"}:
+    if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "pci-add", "pci-remove", "disk-volume-add", "disk-volume-delete", "network-block", "network-restore", "resources", "disk-grow", "cpu-pin", "clone", "template", "export", "backup-full", "backup-workspace", "backup-data-volume", "secret-store", "secret-delete", "secret-inject", "secret-clear", "copy-files", "disposable-retain"}:
         raise ValidationError("Ação de auditoria desconhecida")
     event = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "action": action, "vm": vm, "result": result, "source": source}
@@ -47,7 +47,7 @@ def save_template(name: str, manifest: Manifest) -> Path:
     data["name"] = name
     data["mounts"] = []
     data.pop("copies", None)
-    data["metadata"] = {"template": name}
+    data["metadata"]["template"] = name
     clean = Manifest.parse(data)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -110,7 +110,7 @@ def saved_network_bridge(name: str) -> str | None:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         network = data.get("network", {})
-        bridge = network.get("bridge") if network.get("mode") in {"normal", "restricted"} else None
+        bridge = network.get("bridge") if network.get("mode") in {"normal", "restricted", "lan-only"} else None
         return _name(bridge, "Bridge") if bridge else None
     except (OSError, AttributeError, ValidationError, yaml.YAMLError):
         return None

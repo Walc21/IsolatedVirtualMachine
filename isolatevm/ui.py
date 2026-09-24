@@ -25,6 +25,7 @@ from .storage import (audit, complete_onboarding, first_run, history, load_insta
                       export_manifest_versioned)
 from .secret_vault import SecretVault, validate_secret_name, validate_secret_value
 from .snapshot_policy import PROTECTED_ACTIONS, protection_name
+from .cpu import CPUSelectionError, format_cpu_set, parse_cpu_set
 from . import change_diff as diff
 
 
@@ -32,9 +33,10 @@ from .ui_widgets import CSS, label, button, row, entry, combo
 from .ui_wizard import WizardMixin
 from .ui_details import DetailsMixin
 from .ui_metrics import MetricsMixin
+from .ui_terminal import TerminalMixin
 
 
-class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWindow):
+class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application) -> None:
         super().__init__(application=app, title="IsolateVM")
         self.set_default_size(1100, 730)
@@ -83,11 +85,13 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         self.diagnostics = self._scroll_page("Diagnóstico do Host", "diagnostics")
         self.wizard = self._scroll_page("Novo Ambiente", "wizard")
         self.details = self._scroll_page("Permissões efetivas", "details")
+        self.terminal_page = self._scroll_page("Terminal", "terminal")
         self.metrics_page = self._scroll_page("Monitoramento", "metrics")
         self.templates_page = self._scroll_page("Templates", "templates")
         self.history_page = self._scroll_page("Histórico", "history")
         self.settings_page = self._scroll_page("Configurações", "settings")
         self._build_settings()
+        self._build_terminal_page()
         self._build_wizard()
         self._build_welcome()
         if first_run() or (isinstance(self.service, LocalIncus) and self.service.access_mode == "confined"):
@@ -324,7 +328,11 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             except IncusError:
                 continue
             first = before.get(vm.name)
-            allocated = int(vm.cpu) if vm.cpu.isdigit() else None
+            if vm.cpu.isdigit():
+                allocated = int(vm.cpu)
+            else:
+                try: allocated = len(parse_cpu_set(vm.cpu))
+                except ValidationError: allocated = None
             percent = cpu_percent_between(first[0], after, at - first[1], allocated) if first else None
             result[vm.name] = (after, percent)
         return result
@@ -345,7 +353,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
                              vm.lifecycle_disposition, "ciclo de vida desconhecido")
             card.append(label("Ciclo de vida: " + lifecycle,
                               "risk" if vm.lifecycle_disposition in {"delete-on-close", "restore-initial-on-close", "persist-workspace"} else "muted"))
-        card.append(label(f"Mounts: {vm.mounts}  ·  Snapshots: {vm.snapshots}", "muted"))
+        card.append(label(f"Mounts: {vm.mounts}  ·  Discos de dados: {vm.data_volumes}  ·  Snapshots: {vm.snapshots}", "muted"))
         if vm.copy_state == "pending":
             card.append(label("Cópias únicas pendentes · arquivos ainda não foram colocados no disco da VM", "risk"))
         elif vm.copy_state == "done":
@@ -377,7 +385,27 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
                 lambda: self._state(vm.name, "force-stop")), "destructive-action"))
         actions.append(button("Permissões", lambda: self.show_effective(vm.name)))
         actions.append(button("CPU/RAM", lambda: self._resources_dialog(vm)))
+        pin_button = button("Fixar CPUs do host…", lambda: self._cpu_pin_dialog(vm))
+        pin_button.set_sensitive(vm.status == "Stopped")
+        if vm.status != "Stopped":
+            pin_button.set_tooltip_text("Desligue a VM antes de fixar CPUs lógicas do host")
+        actions.append(pin_button)
+        disk_button = button("Aumentar disco…", lambda: self._disk_grow_dialog(vm))
+        disk_supported = vm.disk.endswith("GiB") and vm.disk[:-3].isdigit() and int(vm.disk[:-3]) < 2048
+        disk_button.set_sensitive(vm.status == "Stopped" and disk_supported)
+        if vm.status != "Stopped":
+            disk_button.set_tooltip_text("Desligue a VM antes de aumentar o disco")
+        elif not disk_supported:
+            disk_button.set_tooltip_text("Requer disco raiz local com tamanho inteiro em GiB, abaixo de 2048 GiB")
+        actions.append(disk_button)
         actions.append(button("Métricas", lambda: self.show_metrics(vm)))
+        integrated = button("Abrir terminal", lambda: self._open_integrated_terminal(vm.name))
+        integrated.set_sensitive(not self.mock and vm.status == "Running")
+        if vm.status != "Running":
+            integrated.set_tooltip_text("Inicie a VM para abrir um terminal integrado")
+        elif self.mock:
+            integrated.set_tooltip_text("O modo mock não abre sessões reais no guest")
+        actions.append(integrated)
         actions.append(button("Terminal externo", lambda: self._terminal(vm.name)))
         console = button("Console VGA", lambda: self._console(vm.name))
         console_ready = bool(shutil.which("remote-viewer") or shutil.which("spicy"))
@@ -392,7 +420,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         actions.append(button("Exportar versão", lambda: self._export_vm_versioned(vm.name)))
         backup = button("Backup completo", lambda: self._ask(
             "Arquivo de backup .tar.gz", str(Path.home() / f"{vm.name}.tar.gz"),
-            lambda path: self._backup_prompt(vm.name, path)))
+            lambda path: self._backup_prompt(vm.name, path, data_volumes=vm.data_volumes)))
         backup.set_sensitive(not self.mock)
         if self.mock: backup.set_tooltip_text("Backup completo exige uma VM Incus real")
         actions.append(backup)
@@ -404,7 +432,8 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             if self.mock: workspace_backup.set_tooltip_text("Exportação de /workspace exige uma VM Incus real")
             actions.append(workspace_backup)
         actions.append(button("Excluir", lambda: self._delete_prompt(
-            vm.name, workspace=vm.lifecycle_disposition == "persist-workspace"), "destructive-action"))
+            vm.name, workspace=vm.lifecycle_disposition == "persist-workspace",
+            data_volumes=vm.data_volumes), "destructive-action"))
         card.append(actions)
         parent.append(card)
 
@@ -610,9 +639,14 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
                 pass  # Incus clone succeeded; its effective state is still available.
         self._audited("clone", name, clone)
 
-    def _delete_prompt(self, name: str, workspace: bool = False) -> None:
-        consequence = (" A VM será removida e o volume separado /workspace, incluindo seus dados, também será apagado."
-                       if workspace else " Discos e snapshots serão removidos.")
+    def _delete_prompt(self, name: str, workspace: bool = False,
+                       data_volumes: int = 0) -> None:
+        consequences = [" Discos raiz e snapshots da VM serão removidos."]
+        if workspace:
+            consequences.append(" O volume separado /workspace e seus dados também serão apagados.")
+        if data_volumes:
+            consequences.append(f" {data_volumes} disco(s) de dados adicional(is) e todo o conteúdo serão apagados.")
+        consequence = "".join(consequences)
         self._ask("Confirme digitando o nome da VM", "", lambda value:
                   self._confirm("Excluir VM definitivamente?", f"VM: {name}.{consequence}",
                                 lambda: self._audited("delete", name, lambda: (self.service.delete(name), remove_instance_manifest(name))))
@@ -685,7 +719,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
             self._work(run)
         except Exception as exc: self._toast(str(exc))
 
-    def _backup_prompt(self, name: str, destination: str) -> None:
+    def _backup_prompt(self, name: str, destination: str, data_volumes: int = 0) -> None:
         target = Path(destination)
         separate_workspace = ""
         try:
@@ -693,9 +727,11 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
                 separate_workspace = " O volume persistente /workspace é separado e não entra neste backup; exporte-o pela ação própria."
         except (OSError, ValidationError):
             pass
+        separate_data = (f" {data_volumes} disco(s) de dados customizado(s) também ficam fora; exporte cada um pela aba Armazenamento."
+                         if data_volumes else "")
         self._confirm("Exportar backup completo?",
                       f"VM: {name}\nArquivo novo: {target}\nInclui o disco e os snapshots da VM. "
-                      "Diretórios do host montados na VM não integram o backup." + separate_workspace +
+                      "Diretórios do host montados na VM não integram o backup." + separate_workspace + separate_data +
                       " Para maior consistência, pare a VM antes. A exportação pode demorar e ocupar muito espaço.",
                       lambda: self._audited("backup-full", name,
                                             lambda: self.service.export_full(name, target),
@@ -717,19 +753,133 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, Gtk.ApplicationWind
         area.set_spacing(10); area.set_margin_start(16); area.set_margin_end(16)
         area.set_margin_top(12); area.set_margin_bottom(12)
         cpu = Gtk.SpinButton.new_with_range(1, 64, 1)
-        cpu.set_value(int(vm.cpu) if vm.cpu.isdigit() and 1 <= int(vm.cpu) <= 64 else 2)
+        if vm.cpu.isdigit() and 1 <= int(vm.cpu) <= 64:
+            current_cpu_count = int(vm.cpu)
+        else:
+            try: current_cpu_count = len(parse_cpu_set(vm.cpu))
+            except (ValidationError, CPUSelectionError): current_cpu_count = 2
+        cpu.set_value(current_cpu_count if 1 <= current_cpu_count <= 64 else 2)
         memory = Gtk.SpinButton.new_with_range(512, 262144, 512)
         digits = "".join(x for x in vm.memory if x.isdigit())
         memory.set_value(int(digits) if digits and "MiB" in vm.memory else 4096)
         area.append(row(f"CPU atual: {vm.cpu}", cpu))
         area.append(row(f"RAM atual: {vm.memory}", memory))
+        area.append(label("Este editor define a quantidade de vCPUs. Pinning de threads lógicas fica em “Fixar CPUs do host”. O Incus reserva limites de CPU por percentual e prioridade para containers, não VMs.", "muted"))
         def selected(d: Gtk.Dialog, response: int) -> None:
             new_cpu, new_memory = cpu.get_value_as_int(), memory.get_value_as_int()
             d.destroy()
             if response != Gtk.ResponseType.OK: return
+            def apply_resources() -> None:
+                self.service.set_resources(vm.name, new_cpu, new_memory)
+                try:
+                    manifest = load_instance_manifest(vm.name)
+                    data = manifest.to_dict()
+                    data["resources"]["cpu"] = new_cpu
+                    data["resources"]["memoryMiB"] = new_memory
+                    data["metadata"].pop("cpuPinning", None)
+                    save_instance_manifest(Manifest.parse(data, check_copy_sources=False))
+                except (OSError, ValidationError):
+                    GLib.idle_add(self._toast, "Recursos aplicados; manifesto local indisponível para sincronização")
             self._review_change(vm.name, "resources",
-                                lambda effective: diff.resources(effective, new_cpu, new_memory),
-                                lambda: self.service.set_resources(vm.name, new_cpu, new_memory))
+                                lambda effective: diff.resources(effective, new_cpu, new_memory, vm.name),
+                                apply_resources)
+        dialog.connect("response", selected)
+        dialog.present()
+
+    def _cpu_pin_dialog(self, vm: VM) -> None:
+        if vm.status != "Stopped":
+            self._error_dialog(ValidationError("Desligue a VM antes de fixar CPUs lógicas do host"))
+            return
+        dialog = Gtk.Dialog(title=f"Fixar CPUs do host · {vm.name}", transient_for=self, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        review = dialog.add_button("Revisar", Gtk.ResponseType.OK)
+        review.set_sensitive(False)
+        area = dialog.get_content_area()
+        area.set_spacing(10); area.set_margin_start(16); area.set_margin_end(16)
+        area.set_margin_top(12); area.set_margin_bottom(12)
+        status = label("Consultando IDs de CPU que o Incus anunciou…", "muted")
+        area.append(status)
+        selection = entry()
+        selection.set_placeholder_text("Ex.: 0-3,6")
+        if not vm.cpu.isdigit():
+            selection.set_text(vm.cpu)
+        area.append(row("CPUs lógicas do host", selection))
+        area.append(label("Use IDs ou intervalos separados por vírgula. A quantidade de IDs define o número de vCPUs. Pinning exige VM parada e não reserva as CPUs exclusivamente: outras VMs e processos do host ainda podem usá-las. A topologia física do host pode levar o Incus a recusar combinações incompatíveis.", "risk"))
+        available: list[int] = []
+        def loaded(values: object) -> None:
+            available.extend(int(value) for value in values)
+            status.set_text("IDs online: " + (", ".join(str(value) for value in available) if available else "nenhum"))
+            if available:
+                review.set_sensitive(True)
+            else:
+                status.add_css_class("error")
+        self._work(self.service.host_cpu_ids, loaded)
+        def response(window: Gtk.Dialog, response_id: int) -> None:
+            raw = selection.get_text().strip()
+            window.destroy()
+            if response_id != Gtk.ResponseType.OK:
+                return
+            try:
+                normalized = format_cpu_set(parse_cpu_set(raw))
+                selected = set(parse_cpu_set(raw))
+                if not selected.issubset(set(available)):
+                    raise ValidationError("Selecione somente IDs que o Incus informou como online")
+            except (ValidationError, CPUSelectionError) as exc:
+                self._toast(str(exc))
+                return
+            def pin_and_sync() -> None:
+                self.service.pin_cpus(vm.name, normalized)
+                try:
+                    manifest = load_instance_manifest(vm.name)
+                    data = manifest.to_dict()
+                    data["resources"]["cpu"] = len(selected)
+                    data["metadata"]["cpuPinning"] = normalized
+                    save_instance_manifest(Manifest.parse(data, check_copy_sources=False))
+                except (OSError, ValidationError):
+                    GLib.idle_add(self._toast, "Pinning aplicado; manifesto local indisponível para sincronização")
+            self._review_change(vm.name, "cpu-pin",
+                                lambda current: diff.cpu_pin(current, normalized, vm.name),
+                                pin_and_sync,
+                                self.show_dashboard)
+        dialog.connect("response", response)
+        dialog.present()
+
+    def _disk_grow_dialog(self, vm: VM) -> None:
+        raw_size = vm.disk[:-3] if vm.disk.endswith("GiB") else ""
+        if vm.status != "Stopped" or not raw_size.isdigit():
+            self._error_dialog(ValidationError("Aumentar o disco requer VM parada e tamanho raiz local em GiB inteiros"))
+            return
+        old_size = int(raw_size)
+        if old_size >= 2048:
+            self._error_dialog(ValidationError("O disco já atingiu o limite atual de 2048 GiB"))
+            return
+        dialog = Gtk.Dialog(title=f"Aumentar disco raiz · {vm.name}", transient_for=self, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Revisar", Gtk.ResponseType.OK)
+        area = dialog.get_content_area()
+        area.set_spacing(10); area.set_margin_start(16); area.set_margin_end(16)
+        area.set_margin_top(12); area.set_margin_bottom(12)
+        size = Gtk.SpinButton.new_with_range(old_size + 1, 2048, 1)
+        size.set_value(min(old_size + 10, 2048))
+        area.append(row(f"Tamanho atual: {old_size} GiB · novo tamanho", size))
+        area.append(label("Esta operação somente aumenta o disco raiz e não pode ser desfeita por redução. A VM precisa estar parada; depois do próximo boot, a partição ou o sistema de arquivos do guest pode exigir expansão.", "risk"))
+        def selected(window: Gtk.Dialog, response: int) -> None:
+            new_size = size.get_value_as_int()
+            window.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+            def grow() -> None:
+                self.service.resize_root_disk(vm.name, new_size)
+                try:
+                    manifest = load_instance_manifest(vm.name)
+                    data = manifest.to_dict()
+                    data["resources"]["diskGiB"] = new_size
+                    save_instance_manifest(Manifest.parse(data, check_copy_sources=False))
+                except (OSError, ValidationError):
+                    GLib.idle_add(self._toast, "Disco aumentado; manifesto local indisponível para sincronização")
+            self._review_change(vm.name, "disk-grow",
+                                lambda effective: diff.root_disk_grow(effective, new_size, vm.name),
+                                grow, self.show_dashboard)
         dialog.connect("response", selected)
         dialog.present()
 

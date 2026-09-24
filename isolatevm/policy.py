@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import Manifest
+from .model import Manifest, PROXIED_NETWORK_MODES
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,9 @@ def assess(manifest: Manifest) -> tuple[Finding, ...]:
     if manifest.networkMode == "restricted":
         findings.append(Finding("NETWORK_RESTRICTED_PROXY", "info",
                                 "Saída restrita usa proxy HTTPS local; DNS e conexões diretas da VM serão bloqueados."))
+    if manifest.networkMode == "lan-only":
+        findings.append(Finding("NETWORK_LAN_PROXY", "warning",
+                                "Apenas os CIDRs RFC1918 declarados por TCP são encaminhados pelo proxy local; destinos precisam ser alcançáveis pelo host. DNS e conexões diretas da VM são bloqueados."))
     if manifest.secrets:
         findings.append(Finding("GUEST_SECRETS", "high",
                                 "Secrets do cofre só são entregues após confirmação; processos do usuário ubuntu na VM poderão lê-los até ela desligar ou os arquivos temporários serem removidos."))

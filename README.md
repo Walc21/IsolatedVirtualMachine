@@ -2,23 +2,23 @@
 
 ## Estado da implementação
 
-O código atual está na versão **0.3.2**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, comparação de alterações antes de aplicá-las e exportação versionada de manifestos e templates.
+O código atual está na versão **0.3.8**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, discos de dados Incus com propriedade validada e cópia independente ao clonar, comparação de alterações antes de aplicá-las, aumento revisável do disco raiz para VMs paradas, exportação versionada de manifestos e templates, consulta das versões instaladas dos pacotes selecionados, ferramentas de coding com IA opcionais no guest e terminal VTE integrado.
 
-A última validação automatizada registrada para esta revisão passou **181 testes**. Também passaram a compilação Python, a checagem de sintaxe do helper DevOps e `git diff --check`. O pacote Ubuntu `0.3.2` (`all`) foi construído e inspecionado, mas não instalado nesta revisão. Essas verificações não executam os instaladores DevOps em uma VM nem exercitam dispositivos físicos.
+O terminal integrado usa VTE GTK4 para abrir `incus exec` em um PTY, sem expor os comandos digitados ao shell do host. A sessão entra como root dentro do guest. O terminal externo permanece disponível como alternativa.
 
 Há validações de integração registradas com VMs descartáveis no Incus, incluindo cópias pontuais, snapshots e restauração, comparação de recursos, ciclo de vida, clone e volume persistente `/workspace`, além da política de egress e entrega de secrets. São resultados de um host e configuração específicos; consulte [o registro de validação](docs/LIVE-VALIDATION.md) antes de extrapolá-los para outro ambiente.
 
-Ainda não foram validados o boot das novas opções de software DevOps, passthrough físico de USB ou GPU, nem login visual interativo em um desktop guest. O projeto não oferece terminal integrado no guest, guests não Ubuntu ou passthrough PCI genérico/serial. O registro de validação descreve esses limites e quais fluxos foram testados apenas com mocks.
+Ainda não foram validados o boot das novas opções de software DevOps, o modo LAN-only, passthrough físico de USB, GPU ou PCI genérico, nem login visual interativo em um desktop guest. O projeto atende guests Ubuntu cloud e não configura diretamente portas seriais virtuais, pois o Incus limita `unix-char`/`unix-hotplug` a containers; adaptadores seriais USB podem ser anexados pela opção USB. O registro de validação descreve esses limites e quais fluxos foram testados apenas com mocks.
 
 O wizard separa **Copiar uma vez** de **Compartilhar permanentemente**. A cópia explícita entra no disco da VM após o primeiro start, sem mount e sem sincronização posterior; o compartilhamento usa um mount persistente com permissão RO ou RW. O preview informa destinos e tamanho antes da criação. Consulte [o contrato do manifesto](docs/MANIFEST.md).
 
-Em **Configurações**, a opção de snapshot de proteção pode ser ativada antes de mudanças em mounts, dispositivos, rede, CPU/RAM e restauração de snapshots. Ela vem desligada, registra a origem automática no Histórico e impede a mudança se o snapshot falhar. Snapshots ficam no mesmo pool Incus da VM e não substituem um backup externo.
+Em **Configurações**, a opção de snapshot de proteção pode ser ativada antes de mudanças em mounts, dispositivos, rede, CPU/RAM, aumento de disco e restauração de snapshots. Ela vem desligada, registra a origem automática no Histórico e impede a mudança se o snapshot falhar. Snapshots ficam no mesmo pool Incus da VM e não substituem um backup externo.
 
 Manifestos e templates podem ser exportados em versões numeradas (`-v0001`, `-v0002`, …). A gravação recusa arquivos existentes. Templates excluem mounts e fontes de cópia pessoais; manifestos exportados preservam os caminhos declarados e devem ser tratados como dados privados.
 
 O wizard oferece ciclos de vida **persistente**, **excluir manualmente**, **excluir ao fechar**, **restaurar snapshot inicial ao fechar** e **persistir somente `/workspace`**. Os dois modos de restauração salvam `isolatevm-initial`; ao fechar, a VM é parada se necessário e o snapshot restaurado. No modo persistir `/workspace`, o disco do sistema retorna ao estado inicial e o volume customizado separado conserva os dados. O clone desse modo recebe uma cópia independente do volume. A exclusão manual remove a VM e seu volume após conferir os marcadores de propriedade. Snapshots e backup completo da VM não incluem esse volume: use **Exportar /workspace**, que grava uma exportação separada com modo `0600`. O snapshot inicial protegido não pode ser renomeado ou excluído pela interface. **Fechar sem aplicar** mantém as VMs como estão. Encerramento forçado do aplicativo não executa ações de fechamento.
 
-Ao alterar CPU/RAM, mounts, rede ou dispositivos de uma VM existente, a interface consulta a configuração efetiva do Incus e mostra um diff de antes/depois com **Cancelar** e **Aplicar alterações**. Antes de aplicar, compara novamente o estado relevante e pede nova revisão se ele mudou. Snapshots de proteção ativados são criados depois dessa comparação e antes da alteração.
+Ao alterar CPU/RAM, mounts, rede, dispositivos ou aumentar o disco de uma VM existente, a interface consulta a configuração efetiva do Incus e mostra um diff de antes/depois com **Cancelar** e **Aplicar alterações**. Antes de aplicar, compara novamente o estado relevante e pede nova revisão se ele mudou. Snapshots de proteção ativados são criados depois dessa comparação e antes da alteração.
 
 **IsolateVM** é um aplicativo desktop GTK local para criar e administrar máquinas virtuais Incus no Ubuntu. Ele oferece manifestos revisáveis, recursos e dispositivos explícitos, um perfil offline por padrão e uma política opcional de proxy de saída por VM.
 
@@ -27,19 +27,25 @@ Ao alterar CPU/RAM, mounts, rede ou dispositivos de uma VM existente, a interfac
 ## O que oferece
 
 - Detecta Ubuntu, arquitetura, virtualização, KVM, QEMU, Incus e recursos disponíveis sem alterar a configuração do host.
-- Cria VMs Ubuntu cloud por um assistente GTK. CPU, memória, pool, disco, rede, mounts, software, desktop e manifesto são revisados antes da criação. O catálogo inclui SDKs .NET compatíveis com a release Ubuntu, uv e Poetry via pipx, Rustup `stable`, toolchains pnpm/Yarn/Bun e opções DevOps para kubectl, Helm e Terraform. Os instaladores opcionais rodam no guest; as opções DevOps ainda não foram testadas em boot real.
+- Cria VMs Ubuntu cloud por um assistente GTK. CPU, memória, pool, disco, rede, mounts, software, desktop e manifesto são revisados antes da criação. O catálogo inclui SDKs .NET compatíveis com a release Ubuntu, uv e Poetry via pipx, Rustup `stable`, toolchains pnpm/Yarn/Bun, ferramentas de coding com IA (Codex, Claude Code, Aider e OpenCode) e opções DevOps para kubectl, Helm e Terraform. Os instaladores opcionais rodam no guest; opções novas ainda precisam de validação em boot real.
 - Inicia, para, reinicia, clona, cria e restaura snapshots e remove VMs criadas pelo aplicativo. Ações destrutivas exigem confirmação explícita.
 - Exibe a configuração Incus efetiva e métricas sob demanda de CPU, memória, disco, rede e uptime quando o Incus as fornece.
-- Importa e exporta manifestos YAML versionados, instala software no guest pelo cloud-init, exporta backup completo da VM e exporta separadamente o volume persistente `/workspace`, em arquivos novos com modo `0600`.
+- Em **Permissões efetivas**, consulta por gerenciador as versões instaladas dos pacotes selecionados no manifesto salvo, sinaliza ausências e versões divergentes e distingue falha de consulta de pacote ausente. Exige VM em execução e agente Incus ativo; o guest fornece os dados e pode alterá-los.
+- Importa e exporta manifestos YAML versionados, instala software no guest pelo cloud-init, exporta backup completo da VM e exporta separadamente `/workspace` ou cada disco de dados gerenciado, em arquivos novos com modo `0600`.
+- Instala npm global sob o usuário `ubuntu` da VM, sem gravar pacotes npm em diretórios root. Ferramentas de coding com IA não recebem tokens ou arquivos de autenticação do host; autentique na VM ou referencie um secret explicitamente.
 - Inclui backend mock (`ISOLATEVM_MOCK=1`) para explorar a interface sem conectar ao Incus nem criar VMs.
 - Oferece desktops opcionais Ubuntu GNOME, KDE e XFCE, terminal externo e console VGA Incus por cliente SPICE.
-- Descobre dispositivos USB e GPUs em modo somente leitura. Anexar USB e GPU é uma ação explícita e confirmada; USB usa serial único ou o endereço atual de barramento/dispositivo e exige nova seleção após reconexão. O passthrough de GPU exige VM parada e depende de autorização do projeto Incus. PCI genérico e serial não são suportados.
+- Abre terminal integrado com VTE GTK4 sobre um PTY `incus exec`; identifica que o shell inicia como root dentro do guest e permite encerrar a conexão sem enviar texto de interface a um shell local.
+- Descobre USB, GPUs e outras funções PCI em modo somente leitura. USB, GPU e PCI exigem ação explícita; USB usa serial único ou endereço atual do dispositivo. GPU e PCI bruto exigem VM parada e autorização do projeto Incus. O seletor PCI exclui funções de rede, GPU e bridge, incluindo funções irmãs da mesma placa. O passthrough PCI pode interromper o host e requer revisão de IOMMU e grupos; nenhum dispositivo físico foi anexado nesta validação.
+- Incus oferece dispositivos `unix-char` e `unix-hotplug` para containers, não VMs. Adaptadores seriais USB podem ser entregues como USB; uma porta serial virtual da VM não é configurada pelo IsolateVM.
+- O disco raiz pode ser aumentado com a VM parada e uma prévia revisável. Redução não é oferecida e o crescimento não redimensiona o sistema de arquivos dentro do guest.
+- Para VMs, o editor ajusta a quantidade de vCPUs. Prioridade e limite de CPU por allowance são opções de containers no Incus; pinning físico de CPUs não é oferecido por esse editor.
 
 ## Rede e perfis de isolamento
 
-O manifesto padrão pede **rede offline**, nenhum mount do host e nenhum dispositivo repassado. O perfil `maximum-isolation` exige rede offline e zero mounts. A política `restricted-development` usa um proxy dedicado por VM e regras de firewall geradas para aceitar somente combinações declaradas de domínio/IP/CIDR e portas TCP. O helper executa separadamente via Polkit, enquanto o processo GTK continua sem privilégios.
+O manifesto padrão pede **rede offline**, nenhum mount do host e nenhum dispositivo repassado. O perfil `maximum-isolation` exige rede offline e zero mounts. A política `restricted-development` usa um proxy dedicado por VM e regras de firewall geradas para aceitar somente combinações declaradas de domínio/IP/CIDR e portas TCP. O modo `lan-only` reusa esse caminho, mas aceita somente CIDRs IPv4 privados explícitos, com portas TCP. O helper revalida o modo e as regras separadamente via Polkit, enquanto o processo GTK continua sem privilégios.
 
-O modo de rede `normal` é uma rede comum para a VM e não filtra domínios. A política de proxy restrito controla a saída de rede do guest; não audita os dados ou programas dentro dele, outros caminhos até o host nem políticas externas ao Incus. Inspecione a configuração efetiva antes de confiar em qualquer perfil. O Incus é a fonte de verdade do estado das VMs, portanto manifestos locais podem divergir depois de alterações externas.
+O modo de rede `normal` é uma rede comum para a VM e não filtra domínios. Uma bridge customizada pode ser selecionada se já existir como bridge gerenciada do Incus; o IsolateVM não configura redes globais nem promete que uma LAN particular seja alcançável pelo host. No modo `lan-only`, somente os CIDRs RFC1918 escolhidos e suas portas TCP são encaminhados pelo proxy; DNS e conexões diretas do guest permanecem bloqueados. A política de proxy restrito controla a saída de rede do guest; não audita os dados ou programas dentro dele, outros caminhos até o host nem políticas externas ao Incus. Inspecione a configuração efetiva antes de confiar em qualquer perfil. O Incus é a fonte de verdade do estado das VMs, portanto manifestos locais podem divergir depois de alterações externas.
 
 Variáveis comuns de ambiente ficam visíveis ao guest e podem ser armazenadas na configuração Incus; use-as somente para dados públicos. Secrets são guardados no Secret Service da sessão do usuário, e o manifesto registra apenas seus nomes. Depois da criação, uma ação explícita envia os valores pela entrada padrão do agente Incus para arquivos no tmpfs `/run` do guest; eles não são incorporados ao manifesto, cloud-init ou configuração Incus. Use `isolatevm-run --secret NOME -- comando` no guest para iniciar um processo com a variável definida. Processos executados como o usuário `ubuntu` podem ler os secrets entregues; limpeza ou desligamento remove os arquivos, mas não apaga cópias já carregadas em processos. O perfil `maximum-isolation` bloqueia secrets. Pastas do host nunca são montadas automaticamente. Selecione somente caminhos que pretende expor e prefira mounts somente para leitura quando possível.
 
@@ -47,7 +53,7 @@ Consulte [SECURITY.md](SECURITY.md), [ARCHITECTURE.md](ARCHITECTURE.md), o [sche
 
 ## Requisitos
 
-- Ubuntu com Python 3.11 ou mais recente, PyGObject, GTK 4, libadwaita, PyYAML e Secret Service (`python3-secretstorage` mais um provedor de sessão, como GNOME Keyring).
+- Ubuntu 24.04 ou mais recente com Python 3.11, PyGObject, GTK 4, libadwaita, VTE GTK4 (`gir1.2-vte-3.91`), PyYAML e Secret Service (`python3-secretstorage` mais um provedor de sessão, como GNOME Keyring).
 - Cliente e daemon Incus configurados localmente para operações reais com VMs. Incus é opcional no modo mock e para explorar a interface.
 - Um pool de armazenamento Incus e, para modos com rede, uma bridge gerenciada adequada. Imagens, pacotes do guest e cloud-init dependem dos remotes e repositórios configurados.
 - A política de egress restrito requer o helper Polkit separado, Squid, nftables e Polkit.
@@ -61,7 +67,7 @@ Instale os pacotes Ubuntu:
 
 ```bash
 sudo apt install python3 python3-gi python3-yaml \
-  gir1.2-gtk-4.0 gir1.2-adw-1 python3-pytest python3-secretstorage
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 python3-pytest python3-secretstorage
 ```
 
 Abra a interface em modo mock ou conecte ao serviço Incus local configurado:
@@ -93,7 +99,7 @@ O workflow do GitHub Actions executa os testes GTK via Xvfb, compila o pacote Py
 
 ```bash
 ./scripts/build-deb.sh
-dpkg-deb --contents dist/isolatevm_0.3.2_all.deb
+dpkg-deb --contents dist/isolatevm_0.3.8_all.deb
 ```
 
 O pacote é gerado localmente em `dist/`; arquivos `.deb` gerados ficam fora do Git. O launcher roda como usuário da sessão. Configurar Incus e as permissões necessárias continua sendo responsabilidade do operador. Consulte [PACKAGING.md](PACKAGING.md) para o conteúdo do pacote e operações opcionais no host.

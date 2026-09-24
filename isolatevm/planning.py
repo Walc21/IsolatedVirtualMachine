@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .incus import IncusService
 from .copy_source import CopySourceError, scan_source
-from .model import Manifest, ValidationError
+from .model import Manifest, PROXIED_NETWORK_MODES, ValidationError
 from .policy import Finding, assess
 from .provision import apt_packages
 
@@ -68,10 +68,12 @@ class CreationPlan:
         lines.extend(["", "REDE E ACESSO AO HOST"])
         if manifest.networkMode == "offline":
             lines.append("Rede: nenhuma NIC; nenhuma rede Incus será criada.")
-        elif manifest.networkMode == "restricted":
+        elif manifest.networkMode in PROXIED_NETWORK_MODES:
             lines.append(f"Rede: NIC eth0 com IPv4 fixo e filtro antispoof na bridge {manifest.bridge}.")
             lines.append("Saída: somente proxy HTTPS local por VM; DNS e conexões diretas da VM serão bloqueados.")
             lines.extend(f"  permitir {rule.kind} {rule.value}:{rule.port}/tcp" for rule in manifest.egress)
+            if manifest.networkMode == "lan-only":
+                lines.append("Modo LAN-only: CIDRs RFC1918 explícitos; somente serviços TCP alcançáveis pelo host, sem DNS do guest.")
             lines.append("O helper Polkit validará Squid e nftables antes de criar a VM; haverá uma autorização administrativa.")
         else:
             lines.append(f"Rede: NIC eth0 na bridge existente {manifest.bridge}; sem filtro de domínio/IP/porta.")

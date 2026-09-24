@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk
 
-from .model import CopySpec, Manifest, Mount, ValidationError
+from .model import CopySpec, Manifest, Mount, PROXIED_NETWORK_MODES, ValidationError
 from .policy import assess
 from .planning import CreationPlan, plan_creation
 from .provision import cloud_config
-from .software_catalog import (APT_CATALOG_PACKAGES, CATALOG_GROUPS, DOTNET_SDK_PACKAGES,
+from .software_catalog import (AI_CODING_ITEMS, AI_CODING_PACKAGES,
+                               AIDER_SUPPORTED_RELEASES, APT_CATALOG_PACKAGES,
+                               CATALOG_GROUPS, DOTNET_SDK_PACKAGES,
                                LANGUAGE_PRESETS, NPM_CATALOG_PACKAGES,
                                PIPX_CATALOG_PACKAGES)
 from .storage import audit, export_manifest, import_manifest, load_template, save_instance_manifest, save_template, save_template_versioned, templates
@@ -60,11 +63,16 @@ class WizardMixin:
         self.desktop_input.set_sensitive(False)
         self.desktop_check.connect("toggled", lambda widget: self.desktop_input.set_sensitive(widget.get_active()))
         self.cpu_input = Gtk.SpinButton.new_with_range(1, 64, 1); self.cpu_input.set_value(2)
+        self.cpu_pinning_input = entry()
+        self.cpu_pinning_input.set_placeholder_text("Opcional · ex.: 0-3,6-7")
         self.ram_input = Gtk.SpinButton.new_with_range(512, 262144, 512); self.ram_input.set_value(4096)
+        self.ram_status = label("", "muted")
+        self.ram_input.connect("value-changed", lambda *_: self._update_ram_capacity())
         self.disk_input = Gtk.SpinButton.new_with_range(8, 2048, 1); self.disk_input.set_value(30)
         self.pool_input = entry("default")
-        self.network_input = combo(["offline", "normal", "restricted"])
+        self.network_input = combo(["offline", "normal", "restricted", "lan-only"])
         self.bridge_input = entry("incusbr0")
+        self.network_input.connect("changed", self._network_mode_changed)
         self.egress_input = entry("github.com:443, api.github.com:443")
         self.security_profile_input = combo(["maximum-isolation", "normal-development", "restricted-development", "custom"])
         self.lifecycle_input = combo(["Persistente", "Excluir manualmente", "Excluir ao fechar o IsolateVM",
@@ -116,19 +124,39 @@ class WizardMixin:
                 body.append(check)
             section.set_child(body)
             self.catalog_sections.append(section)
+        self.ai_coding_checks: dict[str, Gtk.CheckButton] = {}
+        for item in AI_CODING_ITEMS:
+            method = "npm · latest" if item.manager == "npm" else "PyPI / pipx · 0.86.2"
+            check = Gtk.CheckButton(label=f"{item.label} · {method}")
+            if item.package == "opencode-ai@latest":
+                check.set_tooltip_text("O pacote npm baixa o binário nativo da plataforma durante a instalação.")
+            elif item.package == "aider-chat==0.86.2":
+                check.set_tooltip_text("Versão fixada; requer Python 3.10–3.12 (Ubuntu 22.04 ou 24.04).")
+            else:
+                check.set_tooltip_text("Instala somente dentro da VM. Nenhuma autenticação do host é copiada.")
+            self.ai_coding_checks[item.package] = check
+        self.aider_status = label("", "muted")
+        self.release_input.connect("changed", lambda *_: self._update_aider_status())
         self.python_check = Gtk.CheckButton(label="Python (python3, python3-pip)")
         self.node_check = Gtk.CheckButton(label="Node.js (nodejs, npm)")
         self.rust_check = Gtk.CheckButton(label="Rust (rustc, cargo)")
         self.dotnet8_check = Gtk.CheckButton(label="SDK .NET 8.0 · feeds Ubuntu 22.04/24.04")
         self.dotnet10_check = Gtk.CheckButton(label="SDK .NET 10.0 · feeds Ubuntu 24.04/26.04")
-        self.codex_check = Gtk.CheckButton(label="OpenAI Codex CLI na VM (npm, sem credenciais)")
         self.environment_view = Gtk.TextView()
         self.environment_view.set_monospace(True)
         self.environment_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.environment_view.set_size_request(-1, 120)
         self.secret_ref_names: set[str] = set()
         self.save_template_check = Gtk.CheckButton(label="Salvar como template sem caminhos pessoais de mounts e cópias")
+        self._update_aider_status()
         self._render_step()
+
+    def _update_aider_status(self) -> None:
+        release = self.release_input.get_active_text()
+        if release in AIDER_SUPPORTED_RELEASES:
+            self.aider_status.set_text("Aider 0.86.2 está disponível nas imagens Ubuntu 22.04 e 24.04. Ferramentas de coding não recebem credenciais do host; faça login na VM ou referencie secrets explicitamente.")
+        else:
+            self.aider_status.set_text("Aider 0.86.2 requer Python 3.10–3.12 e não está disponível para Ubuntu 26.04. Escolha outra versão Ubuntu ou deixe Aider desmarcado.")
 
     def _render_step(self) -> None:
         self._clear(self.step_body)
@@ -155,14 +183,21 @@ class WizardMixin:
         elif self.wizard_step == 2:
             for title, item in [("vCPU", self.cpu_input), ("RAM (MiB)", self.ram_input)]:
                 self.step_body.append(row(title, item))
+            self.step_body.append(self.ram_status)
+            self._update_ram_capacity()
+            self.step_body.append(row("Pinning de CPUs lógicas do host (opcional)", self.cpu_pinning_input))
+            self.step_body.append(label("IDs do host Incus separados por vírgula; exemplos: 0-3,6-7 ou 2-2 para fixar um único ID. A quantidade de IDs define a quantidade de vCPUs. Consulte os IDs em Hardware após criar a VM. Pinning exige VM parada e não reserva as CPUs exclusivamente.", "muted"))
+            self.step_body.append(button("Mostrar CPUs disponíveis no Incus", self._show_host_cpu_ids))
+            self.step_body.append(label("Limite percentual e prioridade de CPU são opções de containers Incus, não VMs. A arquitetura vem da imagem Ubuntu compatível com o host.", "risk"))
         elif self.wizard_step == 3:
             self.step_body.append(row("Disco (GiB)", self.disk_input))
             self.step_body.append(row("Pool Incus", self.pool_input))
         elif self.wizard_step == 4:
-            self.step_body.append(row("Rede · offline por padrão", self.network_input))
-            self.step_body.append(row("Bridge Incus (rede normal ou restrita)", self.bridge_input))
-            self.step_body.append(row("Saída restrita (domínio, IP ou CIDR:porta; separados por vírgula)", self.egress_input))
-            self.step_body.append(label("Rede restrita usa proxy HTTPS por VM, bloqueia DNS e tráfego direto. Domínios são resolvidos pelo proxy; UDP não é permitido.", "risk"))
+            self.step_body.append(row("Modo de rede · offline por padrão", self.network_input))
+            self.step_body.append(row("Bridge Incus existente", self.bridge_input))
+            self.step_body.append(button("Escolher bridge Incus existente…", self._choose_bridge))
+            self.step_body.append(row("Saída permitida (destino:porta; separados por vírgula)", self.egress_input))
+            self.step_body.append(label("Bridge customizada: escolha uma bridge Incus gerenciada existente; nenhuma rede do host será criada. Internet normal não filtra destinos. Restricted aceita domínio, IPv4 ou CIDR. LAN-only aceita apenas CIDR IPv4 privado em 10/8, 172.16/12 ou 192.168/16. Os dois modos proxied bloqueiam DNS e conexões diretas da VM; o proxy permite somente TCP nas portas declaradas e o host precisa ter rota aos destinos LAN.", "risk"))
         elif self.wizard_step == 5:
             self.step_body.append(label("Acessos ao Host", "section-title"))
             self.step_body.append(label("COMPARTILHAR PERMANENTEMENTE · a pasta continua ligada ao host", "section-title"))
@@ -198,8 +233,10 @@ class WizardMixin:
             self.step_body.append(self.dotnet10_check)
             self.step_body.append(label(".NET 8.0 não está na feed padrão Ubuntu 26.04; .NET 10.0 não está na feed padrão 22.04. O wizard rejeita essas combinações sem uma fonte explícita.", "muted"))
             self.step_body.append(label("AI Coding", "section-title"))
-            self.step_body.append(self.codex_check)
-            self.step_body.append(label("Codex é instalado dentro da VM. Faça login apenas na primeira execução na VM; nenhuma autenticação do host é copiada.", "muted"))
+            for check in self.ai_coding_checks.values():
+                self.step_body.append(check)
+            self.step_body.append(self.aider_status)
+            self.step_body.append(label("OpenAI Codex, Claude Code e OpenCode são instalados pela versão npm atual; Aider usa o release 0.86.2 via pipx. Faça login dentro da VM ou referencie um secret guardado nesta sessão. O host nunca fornece credenciais ou arquivos de autenticação automaticamente.", "muted"))
         elif self.wizard_step == 8:
             self.step_body.append(label("Somente valores não secretos. Uma linha NOME=VALOR por variável.", "risk"))
             self.step_body.append(self.environment_view)
@@ -273,6 +310,86 @@ class WizardMixin:
             result[name] = value
         return result
 
+    def _update_ram_capacity(self) -> None:
+        try:
+            values = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key in {"MemTotal", "MemAvailable"}:
+                    values[key] = int(value.strip().split()[0])
+            total_mib = values["MemTotal"] // 1024
+            available_mib = values["MemAvailable"] // 1024
+        except (OSError, KeyError, ValueError, IndexError):
+            self.ram_status.set_text("Host: memória total e disponível não puderam ser consultadas.")
+            return
+        selected_mib = self.ram_input.get_value_as_int()
+        after_mib = available_mib - selected_mib
+        self.ram_status.set_text(
+            f"Host: {total_mib} MiB no total · {available_mib} MiB disponíveis agora\n"
+            f"VM selecionada: {selected_mib} MiB · estimativa disponível após alocar: {after_mib} MiB. "
+            "Estimativa simples baseada na memória disponível atual; o uso real varia. "
+            "VMs usam RAM fixa e podem pressionar o host quando a memória estiver baixa."
+        )
+        if after_mib < 0:
+            self.ram_status.add_css_class("risk")
+        else:
+            self.ram_status.remove_css_class("risk")
+
+    def _show_host_cpu_ids(self) -> None:
+        def show(values: object) -> None:
+            ids = ", ".join(str(value) for value in values)
+            self._toast("IDs de CPU lógicas online segundo o Incus: " + (ids or "nenhum"))
+        self._work(self.service.host_cpu_ids, show)
+
+    def _network_mode_changed(self, _widget: Gtk.ComboBoxText) -> None:
+        current = self.bridge_input.get_text().strip()
+        if self.network_input.get_active_text() in PROXIED_NETWORK_MODES and current == "incusbr0":
+            self.bridge_input.set_text(f"incusbr-{os.getuid()}")
+        elif self.network_input.get_active_text() not in PROXIED_NETWORK_MODES and current == f"incusbr-{os.getuid()}":
+            self.bridge_input.set_text("incusbr0")
+
+    def _choose_bridge(self) -> None:
+        dialog = Gtk.Dialog(title="Escolher bridge Incus", transient_for=self, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        choose = dialog.add_button("Usar bridge", Gtk.ResponseType.OK)
+        choose.set_sensitive(False)
+        content = dialog.get_content_area()
+        content.set_spacing(8); content.set_margin_start(16); content.set_margin_end(16)
+        content.set_margin_top(12); content.set_margin_bottom(12)
+        content.append(label("Somente bridges gerenciadas retornadas pelo Incus aparecem aqui. A seleção não cria nem altera a bridge.", "muted"))
+        status = label("Consultando bridges…", "muted")
+        content.append(status)
+        chooser = Gtk.ComboBoxText()
+        content.append(chooser)
+        choices: list[str] = []
+
+        def loaded(values: object) -> None:
+            all_bridges = [str(value) for value in values if isinstance(value, str)]
+            mode = self.network_input.get_active_text()
+            choices.extend(value for value in all_bridges
+                           if mode not in PROXIED_NETWORK_MODES or value == f"incusbr-{os.getuid()}")
+            for value in choices:
+                chooser.append_text(value)
+            current = self.bridge_input.get_text().strip()
+            chooser.set_active(choices.index(current) if current in choices else (0 if choices else -1))
+            choose.set_sensitive(bool(choices))
+            status.set_text("Escolha uma bridge disponível." if choices else
+                            ("Proxy restrito exige a bridge incusbr-<UID>, que não foi encontrada."
+                             if mode in PROXIED_NETWORK_MODES else
+                             "Nenhuma bridge Incus gerenciada foi encontrada."))
+
+        self._work(self.service.bridges, loaded,
+                   lambda exc: status.set_text("Não foi possível consultar bridges: " + str(exc)))
+
+        def response(window: Gtk.Dialog, response_id: int) -> None:
+            selected = chooser.get_active_text()
+            window.destroy()
+            if response_id == Gtk.ResponseType.OK and selected:
+                self.bridge_input.set_text(selected)
+
+        dialog.connect("response", response)
+        dialog.present()
+
     def _add_secret_reference(self, name: str) -> None:
         self.secret_ref_names.add(name)
         if self.wizard_step == 8:
@@ -328,6 +445,9 @@ class WizardMixin:
             manager, package = (("apt", key) if ":" not in key else key.split(":", 1))
             {"apt": requested_apt, "pipx": requested_pipx, "npm": requested_npm,
              "external": requested_external}[manager].append(package)
+        for item in AI_CODING_ITEMS:
+            if self.ai_coding_checks[item.package].get_active():
+                {"npm": requested_npm, "pipx": requested_pipx}[item.manager].append(item.package)
         if self.python_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["python"])
         if self.node_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["node"])
         if self.rust_check.get_active(): requested_apt.extend(LANGUAGE_PRESETS["rust"])
@@ -348,7 +468,6 @@ class WizardMixin:
         ordered_external.extend(package for package in external_tools if package not in ordered_external)
         cargo_packages = [x.strip() for x in self.cargo_input.get_text().split(",") if x.strip()]
         go_packages = [x.strip() for x in self.go_input.get_text().split(",") if x.strip()]
-        if self.codex_check.get_active(): npm_packages.append("@openai/codex@latest")
         mounts = []
         for index, editor in enumerate(self.mount_rows, start=1):
             host = editor.host.get_text().strip()
@@ -358,12 +477,14 @@ class WizardMixin:
                            "mode": "rw" if editor.rw.get_active() else "ro"})
         mode = self.network_input.get_active_text()
         egress = []
-        if mode == "restricted":
+        if mode in PROXIED_NETWORK_MODES:
             for value in self.egress_input.get_text().split(","):
                 destination = value.strip()
                 if not destination or destination.count(":") != 1:
                     raise ValidationError("Saída restrita: use destino:porta, separado por vírgula")
                 target, port = destination.rsplit(":", 1)
+                if mode == "lan-only" and "/" not in target:
+                    raise ValidationError("LAN-only: use somente CIDR IPv4 privado:porta")
                 kind = "cidr" if "/" in target else ("ip" if target.replace(".", "").isdigit() else "domain")
                 if not port.isdigit(): raise ValidationError("Saída restrita: porta inválida")
                 egress.append({"kind": kind, "value": target, "port": int(port), "protocol": "tcp"})
@@ -379,9 +500,9 @@ class WizardMixin:
                "resources": {"cpu": self.cpu_input.get_value_as_int(),
                              "memoryMiB": self.ram_input.get_value_as_int(),
                              "diskGiB": self.disk_input.get_value_as_int(), "pool": self.pool_input.get_text().strip()},
-               "network": {"mode": mode, **({"bridge": self.bridge_input.get_text().strip()} if mode in {"normal", "restricted"} else {}),
+               "network": {"mode": mode, **({"bridge": self.bridge_input.get_text().strip()} if mode in {"normal", "restricted", "lan-only"} else {}),
                            **({"egress": egress} if egress else {})},
-               "security": {"profile": "restricted-development" if mode == "restricted" else self.security_profile_input.get_active_text()},
+               "security": {"profile": "restricted-development" if mode in PROXIED_NETWORK_MODES else self.security_profile_input.get_active_text()},
                "lifecycle": lifecycle,
                "mounts": mounts,
                "copies": [{"host": editor.host.get_text().strip(), "guest": editor.guest.get_text().strip(),
@@ -392,7 +513,8 @@ class WizardMixin:
                                               "cargo": cargo_packages, "go": go_packages},
                "secrets": sorted(self.secret_ref_names),
                "environment": self._environment(),
-               "metadata": {}}
+               "metadata": ({"cpuPinning": self.cpu_pinning_input.get_text().strip()}
+                            if self.cpu_pinning_input.get_text().strip() else {})}
         return Manifest.parse(raw)
 
     def _add_mount_row(self, mount: Mount | None = None) -> None:
@@ -496,6 +618,11 @@ class WizardMixin:
 
     def _next(self) -> None:
         if self.wizard_step < 12:
+            if (self.wizard_step == 7 and self.ai_coding_checks["aider-chat==0.86.2"].get_active()
+                    and self.release_input.get_active_text() not in AIDER_SUPPORTED_RELEASES):
+                self._error_dialog(ValidationError(
+                    "Aider 0.86.2 requer Python 3.10 a 3.12; selecione Ubuntu 22.04 ou 24.04 ou desmarque Aider"))
+                return
             self.wizard_step += 1; self._render_step(); return
         manifest = self.current_manifest
         if not manifest: return
@@ -630,8 +757,10 @@ class WizardMixin:
         self.headless_check.set_active(manifest.desktop is None)
         self.desktop_input.set_active({"gnome": 0, "kde": 1, "xfce": 2}.get(manifest.desktop, 0))
         self.cpu_input.set_value(manifest.cpu); self.ram_input.set_value(manifest.memoryMiB)
+        self.cpu_pinning_input.set_text(manifest.cpuPinning or "")
         self.disk_input.set_value(manifest.diskGiB); self.pool_input.set_text(manifest.pool)
-        self.network_input.set_active({"offline": 0, "normal": 1, "restricted": 2}[manifest.networkMode])
+        self.network_input.set_active({"offline": 0, "normal": 1, "restricted": 2,
+                                       "lan-only": 3}[manifest.networkMode])
         profiles = ["maximum-isolation", "normal-development", "restricted-development", "custom"]
         self.security_profile_input.set_active(profiles.index(manifest.securityProfile))
         self.lifecycle_input.set_active({"persistent": 0, "manual-delete": 1,
@@ -667,9 +796,11 @@ class WizardMixin:
                                          package not in selected_presets))
         self.pip_input.set_text(",".join(manifest.pip))
         self.pipx_input.set_text(",".join(package for package in manifest.pipx
-                                         if package not in PIPX_CATALOG_PACKAGES))
+                                         if package not in PIPX_CATALOG_PACKAGES and
+                                         package not in AI_CODING_PACKAGES["pipx"]))
         self.npm_input.set_text(",".join(x for x in manifest.npm
-                                         if x not in NPM_CATALOG_PACKAGES and x != "@openai/codex@latest"))
+                                         if x not in NPM_CATALOG_PACKAGES and
+                                         x not in AI_CODING_PACKAGES["npm"]))
         self.cargo_input.set_text(",".join(manifest.cargo))
         self.go_input.set_text(",".join(manifest.go))
         self.environment_view.get_buffer().set_text("\n".join(f"{key}={value}" for key, value in manifest.environment))
@@ -678,7 +809,10 @@ class WizardMixin:
             self._remove_copy_row(editor)
         for copy in manifest.copies:
             self._add_copy_row(copy.kind, copy)
-        self.codex_check.set_active("@openai/codex@latest" in manifest.npm)
+        selected_ai = {"npm": selected_npm, "pipx": selected_pipx}
+        for item in AI_CODING_ITEMS:
+            self.ai_coding_checks[item.package].set_active(item.package in selected_ai[item.manager])
+        self._update_aider_status()
         for editor in tuple(self.mount_rows):
             self._remove_mount_row(editor)
         for mount in manifest.mounts:

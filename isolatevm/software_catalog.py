@@ -35,6 +35,20 @@ CATALOG_GROUPS: tuple[tuple[str, tuple[CatalogItem, ...]], ...] = (
         CatalogItem("Terraform · repositório HashiCorp", "terraform@hashicorp", "external"))),
 )
 
+# Optional AI coding CLIs are kept separate from the general package catalog so
+# the wizard can present them in its dedicated development-tools step.
+AI_CODING_ITEMS: tuple[CatalogItem, ...] = (
+    CatalogItem("OpenAI Codex CLI", "@openai/codex@latest", "npm"),
+    CatalogItem("Claude Code", "@anthropic-ai/claude-code@latest", "npm"),
+    CatalogItem("Aider", "aider-chat==0.86.2", "pipx"),
+    CatalogItem("OpenCode", "opencode-ai@latest", "npm"),
+)
+AI_CODING_PACKAGES = {
+    manager: frozenset(item.package for item in AI_CODING_ITEMS if item.manager == manager)
+    for manager in ("npm", "pipx")
+}
+AIDER_SUPPORTED_RELEASES = frozenset({"22.04", "24.04"})
+
 LANGUAGE_PRESETS: dict[str, tuple[str, ...]] = {
     "python": ("python3", "python3-pip"),
     "node": ("nodejs", "npm"),
@@ -49,3 +63,8 @@ NPM_CATALOG_PACKAGES = frozenset(item.package for _, group in CATALOG_GROUPS
                                  for item in group if item.manager == "npm")
 DOTNET_SDK_PACKAGES = frozenset({"dotnet-sdk-8.0", "dotnet-sdk-10.0"})
 EXTERNAL_TOOL_PACKAGES = frozenset({"kubectl@1.37", "helm@community", "terraform@hashicorp"})
+EXTERNAL_TOOL_APT_PACKAGES = {
+    "kubectl@1.37": "kubectl",
+    "helm@community": "helm",
+    "terraform@hashicorp": "terraform",
+}

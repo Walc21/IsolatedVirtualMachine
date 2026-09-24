@@ -1,3 +1,5 @@
+import os
+
 from isolatevm.model import Manifest
 from isolatevm.mock import MockIncus
 from isolatevm.planning import CreationPlan, plan_creation
@@ -40,3 +42,18 @@ def test_plan_distinguishes_low_capacity_from_allocation():
     assert "supera o espaço livre" in lines
     assert "RAM solicitada supera" in lines
     assert "limite lógico não é espaço já consumido" in lines
+
+
+def test_plan_explains_lan_only_proxy_and_private_ranges():
+    m = Manifest.parse({"schemaVersion": 1, "name": "lan-vm",
+        "os": {"distribution": "ubuntu", "release": "24.04"},
+        "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+        "network": {"mode": "lan-only", "bridge": f"incusbr-{os.getuid()}", "egress": [
+            {"kind": "cidr", "value": "192.168.1.0/24", "port": 5432}]},
+        "security": {"profile": "restricted-development"}, "mounts": [], "software": {"apt": []}})
+    service = MockIncus()
+    plan = plan_creation(service, m)
+    lines = "\n".join(plan.lines())
+    assert "Modo LAN-only" in lines
+    assert "192.168.1.0/24:5432/tcp" in lines
+    assert "alcançáveis pelo host" in lines

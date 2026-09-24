@@ -40,6 +40,17 @@ def test_usb_effective_identity_prefers_serial_then_live_address():
     ]
 
 
+def test_pci_effective_identity_and_ownership_are_explicit():
+    config = {"devices": {"isopci0": {"type": "pci", "address": "0000:02:00.0"}},
+              "config": {"user.isolatevm.managed": "true"}, "profiles": []}
+    summary = describe_effective(config, config)
+    assert summary["other_devices"] == [
+        {"device": "isopci0", "type": "pci", "managed": True,
+         "identity": "0000:02:00.0"},
+    ]
+    assert any("rede" in warning for warning in summary["warnings"])
+
+
 def test_managed_mount_and_nic_require_marker_and_no_profiles():
     config = {"devices": {"isovm0": {"type": "disk", "source": "/home/alice/project", "path": "/workspace"},
                           "eth0": {"type": "nic", "network": "incusbr0"}},
@@ -71,7 +82,9 @@ def test_maximum_isolation_allows_only_marked_managed_workspace_volume():
                          "user.isolatevm.lifecycle-disposition": "persist-workspace",
                          "user.isolatevm.workspace-volume": volume}, "profiles": []}
     summary = describe_effective(config, config)
-    assert summary["volumes"] == [{"device": "isovm-workspace", "source": volume, "path": "/workspace"}]
+    assert summary["volumes"] == [{"device": "isovm-workspace", "source": volume,
+                                   "path": "/workspace", "pool": "default", "mode": "RW",
+                                   "managed": False, "size": "não informado"}]
     assert not any("Máximo isolamento diverge" in finding for finding in summary["warnings"])
     config["devices"]["isovm-workspace"]["source"] = "/home/alice/project"
     summary = describe_effective(config, config)

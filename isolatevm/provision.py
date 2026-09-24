@@ -59,7 +59,9 @@ def cloud_config(manifest: Manifest, proxy_url: str | None = None) -> str | None
         commands.append(["python3", "-m", "venv", "/opt/isolatevm/python"])
         commands.append(["/opt/isolatevm/python/bin/pip", "install", *manifest.pip])
     if manifest.npm:
-        commands.append(["npm", "install", "--global", *manifest.npm])
+        commands.append(["/usr/sbin/runuser", "--user", "ubuntu", "--", "/usr/bin/env",
+                         "npm_config_prefix=/home/ubuntu/.local", "/usr/bin/npm",
+                         "install", "--global", *manifest.npm])
     for spec in manifest.cargo:
         crate, version = spec.rsplit("@", 1)
         commands.append(["cargo", "install", "--locked", "--root", "/usr/local",
@@ -85,8 +87,8 @@ def cloud_config(manifest: Manifest, proxy_url: str | None = None) -> str | None
         files.append({"path": "/usr/local/lib/isolatevm/setup-devops-packages",
                       "content": _guest_helper("isolatevm-setup-devops"),
                       "owner": "root:root", "permissions": "0750"})
-    if manifest.pipx:
-        files.append({"path": "/etc/profile.d/isolatevm-pipx.sh",
+    if manifest.pipx or manifest.npm:
+        files.append({"path": "/etc/profile.d/isolatevm-user-tools.sh",
                       "content": 'case ":$PATH:" in *:/home/ubuntu/.local/bin:*) ;; *) PATH="$PATH:/home/ubuntu/.local/bin" ;; esac\nexport PATH\n',
                       "owner": "root:root", "permissions": "0644"})
     if not apt and not commands and not manifest.environment and not proxy_url and not manifest.secrets and not manifest.copies: return None

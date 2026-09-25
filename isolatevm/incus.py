@@ -1581,7 +1581,10 @@ class LocalIncus:
 
     def host_cpu_ids(self) -> tuple[int, ...]:
         self._require_connection_approval()
-        data = self._read("/1.0/resources", "info", "--resources", "--format=json")
+        # `incus info --resources` has no JSON-format flag in supported Incus
+        # clients. Query the resource API directly so the confined-socket path
+        # receives the same JSON structure as the trusted API path.
+        data = self._read("/1.0/resources", "query", "/1.0/resources")
         try:
             ids = parse_host_cpu_ids(data)
         except CPUSelectionError as exc:

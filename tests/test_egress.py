@@ -336,7 +336,8 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
             line = f"pid_filename {root / 'squid.pid'}"
         rewritten.append(line)
     config.write_text(
-        f"hosts_file {hosts}\nconnect_timeout 1 seconds\n" + "\n".join(rewritten) + "\n",
+        f"hosts_file {hosts}\nconnect_timeout 1 seconds\n"
+        "debug_options ALL,1 33,2 28,9\n" + "\n".join(rewritten) + "\n",
         encoding="utf-8",
     )
     config.chmod(0o644)
@@ -400,7 +401,9 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
 
         # A public address passes the ACL; the network may still reject the
         # actual connection, so a Squid 503 is an allowed-policy result.
-        assert status_code() != 403
+        code = status_code()
+        cache_log = (root / "squid.cache.log").read_text(encoding="utf-8", errors="replace")
+        assert code != 403, f"public destination denied with HTTP {code}; Squid cache log:\n{cache_log[-6000:]}"
         for answer in (
             "127.0.0.1 target.example\n",
             "10.2.3.4 target.example\n",

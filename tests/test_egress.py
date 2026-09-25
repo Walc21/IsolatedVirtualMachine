@@ -317,7 +317,7 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         elif line.startswith("acl vm_source src "):
             line = "acl vm_source src 127.0.0.1"
         elif line.startswith("cache_log "):
-            line = "cache_log stdio:/dev/null"
+            line = f"cache_log {root / 'squid.cache.log'}"
         elif line.startswith("access_log "):
             line = "access_log stdio:/dev/null"
         elif line == "pid_filename none":
@@ -340,7 +340,11 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
 
     def startup_failure(phase: str) -> str:
         stderr_log.flush()
-        detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+        stderr_detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+        cache_log_path = root / "squid.cache.log"
+        cache_detail = (cache_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        if cache_log_path.exists() else "")
+        detail = "\n".join(part for part in (stderr_detail, cache_detail) if part)
         suffix = f"\nSquid stderr:\n{detail}" if detail else " (no stderr output)"
         return f"Squid exited during {phase} with status {process.returncode}{suffix}"
 

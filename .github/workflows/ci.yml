@@ -45,4 +45,4 @@ jobs:
         run: ./scripts/build-deb.sh
 
       - name: Inspect package metadata
-        run: dpkg-deb --field dist/isolatevm_0.3.9_all.deb Package Version Architecture
+        run: dpkg-deb --field dist/isolatevm_0.3.10_all.deb Package Version Architecture

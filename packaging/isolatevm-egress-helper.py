@@ -16,6 +16,7 @@ from pathlib import Path
 import pwd
 import re
 import selectors
+import socket
 import stat
 import subprocess
 import sys
@@ -30,6 +31,7 @@ CONFIG = Path("/etc/isolatevm/egress")
 LOG = Path("/var/log/isolatevm/egress")
 STATE = ROOT / "state.json"
 LOCK = ROOT / ".lock"
+OPERATION_LOCK = ROOT / ".operation.lock"
 FIREWALL_SERVICE = "isolatevm-egress-firewall.service"
 INCUS_SERVICE_UNITS = ("incus.service", "snap.incus.daemon.service")
 FIREWALL_DROPIN = "[Unit]\nRequires=isolatevm-egress-firewall.service\nAfter=isolatevm-egress-firewall.service\n"
@@ -403,6 +405,16 @@ def remove_firewall_guard() -> None:
     run("/usr/bin/systemctl", "daemon-reload")
 
 
+def firewall_guard_preexisting() -> bool:
+    """Keep operator or earlier-policy boot wiring when an update fails."""
+    if any((Path("/etc/systemd/system") / f"{service}.d" /
+            "10-isolatevm-egress.conf").exists() for service in INCUS_SERVICE_UNITS):
+        return True
+    enabled = run("/usr/bin/systemctl", "is-enabled", FIREWALL_SERVICE, check=False)
+    active = run("/usr/bin/systemctl", "is-active", FIREWALL_SERVICE, check=False)
+    return enabled.returncode == 0 or active.returncode == 0
+
+
 def bridge_info(bridge: str, uid: int) -> tuple[str, ipaddress.IPv4Network]:
     if bridge != f"incusbr-{uid}":
         raise Error("a bridge precisa pertencer ao usuário Polkit")
@@ -440,6 +452,23 @@ def lease_addresses(bridge: str, uid: int) -> set[str]:
     if not successes:
         raise Error("não foi possível consultar leases Incus nos projetos locais")
     return addresses
+
+
+def instance_exists(name_value: str, uid: int) -> bool:
+    """Require a successful scoped Incus inventory before deleting policy."""
+    result = run_limited(["/usr/bin/incus", "--force-local", "--project", f"user-{uid}",
+                          "list", "--format", "json"], output_limit_bytes=4_000_000)
+    if result.returncode:
+        raise Error("não foi possível confirmar se a VM ainda existe")
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise Error("inventário Incus inválido; política restrita preservada") from exc
+    if (not isinstance(rows, list) or
+            any(not isinstance(row, dict) or not isinstance(row.get("name"), str)
+                for row in rows)):
+        raise Error("inventário Incus inválido; política restrita preservada")
+    return any(row["name"] == name_value for row in rows)
 
 
 def choose_address(current: dict[str, object] | None, occupied: set[str], network: ipaddress.IPv4Network) -> tuple[str, int]:
@@ -512,14 +541,26 @@ def write_config(name_value: str, content: str) -> None:
 def prepare_logs(name_value: str) -> None:
     account = pwd.getpwnam("proxy")
     LOG.mkdir(parents=True, exist_ok=True, mode=0o750)
-    info = LOG.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
-        raise Error("diretório de logs do proxy inseguro")
+    try:
+        directory_fd = os.open(LOG, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                               os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise Error("diretório de logs do proxy inseguro") from exc
+    try:
+        info = os.fstat(directory_fd)
+        # Older IsolateVM releases made this directory proxy-owned. Adopt that
+        # known legacy layout through the already-open directory descriptor so
+        # the proxy cannot keep changing entries while root hardens it.
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, account.pw_uid} or
+                info.st_mode & 0o022):
+            raise Error("diretório de logs do proxy inseguro")
+        os.fchown(directory_fd, 0, account.pw_gid)
+        os.fchmod(directory_fd, 0o750)
+    finally:
+        os.close(directory_fd)
     # The proxy may write existing files but must not create or replace names
-    # in this directory. This prevents a compromised proxy account from
-    # planting symlinks that a later privileged apply would chown as root.
-    os.chmod(LOG, 0o750)
-    os.chown(LOG, 0, account.pw_gid)
+    # in this root-owned directory. This prevents a compromised proxy account
+    # from planting symlinks that a later privileged apply would chown as root.
     for suffix in (".cache.log", ".access.log"):
         target = LOG / f"{name_value}{suffix}"
         try:
@@ -629,6 +670,37 @@ def stop_disable_proxy(name_value: str) -> None:
         raise Error("proxy restrito não pôde ser parado e desabilitado com segurança")
 
 
+def wait_for_proxy(name_value: str, gateway: str, port: int) -> None:
+    """Do not report policy readiness until this instance owns a live listener."""
+    service_name = f"isolatevm-egress@{name_value}.service"
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        status = run("/usr/bin/systemctl", "is-active", service_name, check=False)
+        if status.returncode != 0 or status.stdout.strip() in {"failed", "inactive", "deactivating"}:
+            raise Error("proxy restrito não permaneceu ativo após iniciar")
+        if status.stdout.strip() != "active":
+            time.sleep(0.1)
+            continue
+        try:
+            with socket.create_connection((gateway, port), timeout=0.5) as connection:
+                connection.settimeout(0.5)
+                connection.sendall(
+                    b"CONNECT isolatevm-healthcheck.invalid:443 HTTP/1.1\r\n"
+                    b"Host: isolatevm-healthcheck.invalid:443\r\n"
+                    b"Connection: close\r\n\r\n")
+                with connection.makefile("rb") as response:
+                    status_line = response.readline(256).split()
+                if (len(status_line) >= 2 and status_line[0].startswith(b"HTTP/") and
+                        status_line[1] == b"403"):
+                    return
+                if status_line:
+                    raise Error("listener do proxy não aplicou a negação padrão")
+        except OSError:
+            pass
+        time.sleep(0.1)
+    raise Error("proxy restrito não abriu o listener esperado")
+
+
 def best_effort_stop_disable_proxy(name_value: str) -> None:
     for action in ("stop", "disable"):
         try:
@@ -646,7 +718,22 @@ def restore_firewall() -> None:
     apply_nft(state())
 
 
-def apply(request: dict[str, object], uid: int) -> dict[str, object]:
+def _validate_apply_request(request: dict[str, object], uid: int) -> None:
+    if set(request) != {"version", "name", "bridge", "network_mode", "rules"}:
+        raise Error("campos de pedido inválidos")
+    name(request["name"])
+    network_mode = request["network_mode"]
+    rules(request["rules"], network_mode)
+    bridge = request["bridge"]
+    if not isinstance(bridge, str) or not NAME.fullmatch(bridge):
+        raise Error("bridge inválida")
+    if bridge != f"incusbr-{uid}":
+        raise Error("a bridge precisa pertencer ao usuário Polkit")
+    bridge_info(bridge, uid)
+
+
+def apply(request: dict[str, object], uid: int, *,
+          guard_preexisting_override: bool | None = None) -> dict[str, object]:
     if set(request) != {"version", "name", "bridge", "network_mode", "rules"}: raise Error("campos de pedido inválidos")
     name_value, bridge = name(request["name"]), request["bridge"]
     network_mode = request["network_mode"]
@@ -654,6 +741,9 @@ def apply(request: dict[str, object], uid: int) -> dict[str, object]:
     if not isinstance(bridge, str) or not NAME.fullmatch(bridge): raise Error("bridge inválida")
     gateway, network = bridge_info(bridge, uid)
     data = state()
+    guard_preexisting = (True if data else
+                         firewall_guard_preexisting() if guard_preexisting_override is None else
+                         guard_preexisting_override)
     key = scoped_name(uid, name_value)
     existing = data.get(key)
     service_name = key
@@ -701,10 +791,26 @@ def apply(request: dict[str, object], uid: int) -> dict[str, object]:
         apply_nft(data)
         unit(service_name, "enable")
         unit(service_name, "restart")
-    except Exception:
+        wait_for_proxy(service_name, gateway, port)
+    except Exception as exc:
         # Preserve state, config, logs, and firewall for an idempotent retry;
         # only stop/disable the service instance whose validated name we own.
         best_effort_stop_disable_proxy(service_name)
+        if existing is None:
+            try:
+                persisted = state()
+            except Exception as state_error:
+                raise Error(f"política restrita falhou e o estado persistente não pôde ser confirmado: {state_error}") from exc
+            if key in persisted:
+                try:
+                    remove({"version": 1, "name": name_value}, uid)
+                except Exception as cleanup_error:
+                    raise Error(f"primeira política falhou; recursos foram preservados para revisão: {cleanup_error}") from exc
+            elif not persisted and not guard_preexisting:
+                try:
+                    remove_firewall_guard()
+                except Exception as cleanup_error:
+                    raise Error(f"política restrita falhou; limpeza da guarda de boot pendente: {cleanup_error}") from exc
         raise
     return {"address": address, "gateway": gateway, "port": port, "mac": mac}
 
@@ -728,6 +834,8 @@ def remove(request: dict[str, object], uid: int) -> None:
     recorded_name = record.get("name", name_value if state_key == name_value else None)
     if recorded_uid != uid or recorded_name != name_value:
         raise Error("política restrita pertence a outra VM ou usuário")
+    if instance_exists(name_value, uid):
+        raise Error("VM ainda existe; política restrita foi preservada")
     service_name = record.get("service_name", state_key)
     if not isinstance(service_name, str) or not SERVICE_INSTANCE.fullmatch(service_name):
         raise Error("identificador de serviço de rede inválido")
@@ -745,6 +853,8 @@ def remove(request: dict[str, object], uid: int) -> None:
 
 
 def main() -> int:
+    operation_fd = -1
+    lock_fd = -1
     try:
         command = sys.argv[1] if len(sys.argv) == 2 else ""
         if command.startswith("serve:"):
@@ -766,15 +876,52 @@ def main() -> int:
         else:
             raise Error("operação não suportada")
         ensure_state_directory()
+
+        guard_preexisting: bool | None = None
+        if command in {"apply", "remove"}:
+            operation_fd = os.open(OPERATION_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            operation_info = os.fstat(operation_fd)
+            if (not stat.S_ISREG(operation_info.st_mode) or operation_info.st_uid != 0 or
+                    operation_info.st_nlink != 1):
+                raise Error("arquivo de operação inseguro; intervenção administrativa necessária")
+            os.fchmod(operation_fd, 0o600)
+            fcntl.flock(operation_fd, fcntl.LOCK_EX)
+
+        if command == "apply":
+            _validate_apply_request(request, uid)
+            # The firewall service runs the same helper and takes LOCK. Start
+            # it before acquiring LOCK here so its restore-firewall command can
+            # finish instead of deadlocking the first proxy start on a fresh
+            # host. OPERATION_LOCK serializes apply/remove across this gap.
+            guard_preexisting = firewall_guard_preexisting()
+            try:
+                ensure_bridge_netfilter()
+                ensure_firewall_guard()
+                run("/usr/bin/systemctl", "start", FIREWALL_SERVICE)
+            except Exception as exc:
+                if not guard_preexisting:
+                    try:
+                        persisted = state()
+                    except Exception as state_error:
+                        raise Error(f"política restrita falhou e o estado persistente não pôde ser confirmado: {state_error}") from exc
+                    if not persisted:
+                        try:
+                            remove_firewall_guard()
+                        except Exception as cleanup_error:
+                            raise Error(f"política restrita falhou; limpeza da guarda de boot pendente: {cleanup_error}") from exc
+                raise
+
         lock_fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         lock_info = os.fstat(lock_fd)
         if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_nlink != 1:
-            os.close(lock_fd)
             raise Error("arquivo de bloqueio inseguro; intervenção administrativa necessária")
         os.fchmod(lock_fd, 0o600)
         with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock:
+            lock_fd = -1
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if command == "apply": print(json.dumps(apply(request, uid), separators=(",", ":")))
+            if command == "apply": print(json.dumps(apply(request, uid,
+                                                           guard_preexisting_override=guard_preexisting),
+                                                       separators=(",", ":")))
             elif command == "remove": remove(request, uid)
             elif command == "restore-firewall": restore_firewall()
             else:
@@ -784,6 +931,10 @@ def main() -> int:
     except (Error, OSError, subprocess.TimeoutExpired) as exc:
         print(f"isolatevm-egress-helper: {exc}", file=sys.stderr)
         return 2
+    finally:
+        for fd in (lock_fd, operation_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 if __name__ == "__main__": raise SystemExit(main())

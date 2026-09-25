@@ -1261,6 +1261,26 @@ def test_local_cpu_pinning_uses_host_thread_ranges_and_requires_managed_stopped_
     assert len(calls) == 1
 
 
+def test_confined_host_cpu_inventory_uses_resources_json_endpoint():
+    service = LocalIncus.__new__(LocalIncus)
+    service.access_mode = "confined"
+    service._confined_approved = True
+    calls = []
+    resources = {"cpu": {"sockets": [{"cores": [{"threads": [
+        {"id": 0, "thread": 0, "online": True, "isolated": False},
+        {"id": 2, "thread": 0, "online": True, "isolated": False},
+        {"id": 4, "thread": 0, "online": False, "isolated": False},
+    ]}]}]}}
+
+    def read(endpoint, *cli):
+        calls.append((endpoint, cli))
+        return resources
+
+    service._read = read
+    assert service.host_cpu_ids() == (0, 2)
+    assert calls == [("/1.0/resources", ("query", "/1.0/resources"))]
+
+
 def test_preflight_refuses_offline_cpu_ids_before_creation():
     raw = sample().to_dict()
     raw["metadata"] = {"cpuPinning": "0-1"}

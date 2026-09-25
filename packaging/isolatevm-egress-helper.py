@@ -38,6 +38,7 @@ MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_COMMAND_INPUT_BYTES = MAX_STATE_BYTES
 MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
 DOMAIN_EGRESS_MARK = "0x49564d00"  # Reserved by IsolateVM for domain-allowlist sockets.
+SERVICE_INSTANCE = re.compile(r"(?:u[0-9]+-)?[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 # Based on the IANA IPv4 Special-Purpose Address Registry, plus IPv4
 # multicast. Domain rules are IPv4-only: the generated Squid policy rejects a
@@ -172,6 +173,30 @@ def scoped_name(uid: int, vm_name: str) -> str:
     if type(uid) is not int or not 1000 <= uid <= 4_294_967_294:
         raise Error("UID de usuário inválido")
     return f"u{uid}-{vm_name}"
+
+
+def squid_service_name(instance: object) -> str:
+    if not isinstance(instance, str) or not SERVICE_INSTANCE.fullmatch(instance):
+        raise Error("identificador de serviço de rede inválido")
+    digest = hashlib.sha256(f"isolatevm-squid:{instance}".encode("ascii")).hexdigest()[:24]
+    return f"ivm{digest}"
+
+
+def serve_proxy(instance: str) -> None:
+    service_id = squid_service_name(instance)
+    config = CONFIG / f"{instance}.conf"
+    try:
+        directory_info = CONFIG.lstat()
+        info = config.lstat()
+    except OSError as exc:
+        raise Error("configuração do proxy não está disponível") from exc
+    if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or
+            directory_info.st_mode & 0o022):
+        raise Error("diretório de configuração do proxy está inseguro")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise Error("configuração do proxy está insegura")
+    os.execv("/usr/sbin/squid", ["/usr/sbin/squid", "-n", service_id,
+                                  "--foreground", "-N", "-f", str(config)])
 
 
 def _legacy_owner(record: object) -> int | None:
@@ -704,7 +729,7 @@ def remove(request: dict[str, object], uid: int) -> None:
     if recorded_uid != uid or recorded_name != name_value:
         raise Error("política restrita pertence a outra VM ou usuário")
     service_name = record.get("service_name", state_key)
-    if not isinstance(service_name, str) or not re.fullmatch(r"(?:u[0-9]+-)?[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", service_name):
+    if not isinstance(service_name, str) or not SERVICE_INSTANCE.fullmatch(service_name):
         raise Error("identificador de serviço de rede inválido")
     stop_disable_proxy(service_name)
     target = CONFIG / f"{service_name}.conf"
@@ -722,6 +747,11 @@ def remove(request: dict[str, object], uid: int) -> None:
 def main() -> int:
     try:
         command = sys.argv[1] if len(sys.argv) == 2 else ""
+        if command.startswith("serve:"):
+            require_systemd_root()
+            instance = command.removeprefix("serve:")
+            serve_proxy(instance)
+            return 0
         if command == "restore-firewall":
             require_systemd_root()
             uid = None

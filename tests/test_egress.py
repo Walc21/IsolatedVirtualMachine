@@ -289,6 +289,18 @@ def test_domain_proxy_rules_require_live_resolution_and_reject_any_non_global_an
         assert address in helper.NON_GLOBAL_DESTINATIONS
 
 
+def test_squid_instances_get_distinct_alphanumeric_service_names():
+    helper = _helper_module()
+    first = helper.squid_service_name("u1000-locked-vm")
+    second = helper.squid_service_name("u1000-other-vm")
+    assert first.startswith("ivm") and first.isalnum()
+    assert second.startswith("ivm") and second.isalnum()
+    assert first != second
+    assert helper.squid_service_name("u1000-locked-vm") == first
+    with pytest.raises(helper.Error, match="identificador de serviço"):
+        helper.squid_service_name("../../squid")
+
+
 def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(request):
     from pathlib import Path
 
@@ -328,13 +340,14 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         encoding="utf-8",
     )
     config.chmod(0o644)
-    parsed = subprocess.run([str(squid), "-k", "parse", "-f", str(config)],
+    service_name = helper.squid_service_name("u1000-test")
+    parsed = subprocess.run([str(squid), "-n", service_name, "-k", "parse", "-f", str(config)],
                             capture_output=True, text=True, timeout=10, check=False)
     assert parsed.returncode == 0, parsed.stderr[-1000:]
 
     stderr_path = root / "squid.stderr"
     stderr_log = stderr_path.open("wb")
-    process = subprocess.Popen([str(squid), "--foreground", "-N", "-f", str(config)],
+    process = subprocess.Popen([str(squid), "-n", service_name, "--foreground", "-N", "-f", str(config)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=stderr_log, close_fds=True)
 
@@ -345,7 +358,7 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         cache_detail = (cache_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
                         if cache_log_path.exists() else "")
         detail = "\n".join(part for part in (stderr_detail, cache_detail) if part)
-        suffix = f"\nSquid stderr:\n{detail}" if detail else " (no stderr output)"
+        suffix = f"\nSquid logs:\n{detail}" if detail else " (no log output)"
         return f"Squid exited during {phase} with status {process.returncode}{suffix}"
 
     def status_code() -> int:
@@ -358,7 +371,7 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
 
     def rebind(answer: str) -> None:
         hosts.write_text(answer, encoding="ascii")
-        result = subprocess.run([str(squid), "-k", "reconfigure", "-f", str(config)],
+        result = subprocess.run([str(squid), "-n", service_name, "-k", "reconfigure", "-f", str(config)],
                                 capture_output=True, text=True, timeout=5, check=False)
         assert result.returncode == 0, result.stderr[-1000:]
         deadline = time.monotonic() + 3

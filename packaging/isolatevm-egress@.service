@@ -9,7 +9,7 @@ Type=simple
 RuntimeDirectory=isolatevm-egress
 RuntimeDirectoryMode=0755
 ExecStartPre=/usr/sbin/squid -k parse -f /etc/isolatevm/egress/%i.conf
-ExecStart=/usr/sbin/squid --foreground -N -f /etc/isolatevm/egress/%i.conf
+ExecStart=/usr/lib/isolatevm/isolatevm-egress-helper serve:%i
 KillMode=mixed
 TimeoutStopSec=10
 

@@ -473,8 +473,8 @@ def squid_config(name_value: str, address: str, gateway: str, port: int, allow: 
         # makes failed resolution deny by default; rejecting any IPv6 answer
         # avoids cross-family ACL ambiguity. dst checks every resolved IPv4
         # candidate, so one non-global answer rejects a mixed result/rebinding.
-        lines += ["acl destination_has_ipv4_address dst ipv4",
-                  "acl destination_has_ipv6_address dst ipv6",
+        lines += ["acl destination_has_ipv4_address dst 0.0.0.0/0",
+                  "acl destination_has_ipv6_address dst ::/0",
                   "acl non_global_destination dst " + " ".join(NON_GLOBAL_DESTINATIONS)]
     for index, rule in enumerate(allow):
         kind, value, destination_port = rule["kind"], rule["value"], rule["port"]

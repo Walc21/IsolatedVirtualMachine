@@ -276,8 +276,8 @@ def test_domain_proxy_rules_require_live_resolution_and_reject_any_non_global_an
     helper = _helper_module()
     config = helper.squid_config("u1000-locked-vm", "10.0.0.200", "10.0.0.1", 20200,
                                  [{"kind": "domain", "value": "github.com", "port": 443}])
-    assert "acl destination_has_ipv4_address dst ipv4" in config
-    assert "acl destination_has_ipv6_address dst ipv6" in config
+    assert "acl destination_has_ipv4_address dst 0.0.0.0/0" in config
+    assert "acl destination_has_ipv6_address dst ::/0" in config
     assert "acl non_global_destination dst " in config
     assert "acl destination_0 dstdomain -n github.com" in config
     assert f"tcp_outgoing_mark {helper.DOMAIN_EGRESS_MARK} vm_source destination_0" in config

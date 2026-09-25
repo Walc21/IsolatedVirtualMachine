@@ -332,9 +332,17 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
                             capture_output=True, text=True, timeout=10, check=False)
     assert parsed.returncode == 0, parsed.stderr[-1000:]
 
+    stderr_path = root / "squid.stderr"
+    stderr_log = stderr_path.open("wb")
     process = subprocess.Popen([str(squid), "--foreground", "-N", "-f", str(config)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, close_fds=True)
+                               stderr=stderr_log, close_fds=True)
+
+    def startup_failure(phase: str) -> str:
+        stderr_log.flush()
+        detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+        suffix = f"\nSquid stderr:\n{detail}" if detail else " (no stderr output)"
+        return f"Squid exited during {phase} with status {process.returncode}{suffix}"
 
     def status_code() -> int:
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=2) as client:
@@ -352,7 +360,7 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                pytest.fail(f"Squid exited during reconfigure with status {process.returncode}")
+                pytest.fail(startup_failure("reconfigure"))
             try:
                 with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
                     return
@@ -364,7 +372,7 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                pytest.fail(f"Squid exited during startup with status {process.returncode}")
+                pytest.fail(startup_failure("startup"))
             try:
                 with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
                     break
@@ -392,12 +400,14 @@ def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(reques
         rebind("127.0.0.1 target.example\n")
         assert status_code() == 403
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        stderr_log.close()
 
 
 def test_explicit_ip_and_cidr_proxy_rules_keep_their_explicit_destination_semantics():

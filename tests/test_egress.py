@@ -201,6 +201,7 @@ def test_policy_update_stops_the_old_proxy_before_replacing_its_acl(monkeypatch)
     monkeypatch.setattr(helper, "write_config", lambda *_args: events.append(("config", None)))
     monkeypatch.setattr(helper, "save_state", lambda _data: events.append(("state", None)))
     monkeypatch.setattr(helper, "apply_nft", lambda _data: events.append(("firewall", None)))
+    monkeypatch.setattr(helper, "wait_for_proxy", lambda *_args: events.append(("listener", None)))
     helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
                   "network_mode": "restricted",
                   "rules": [{"kind": "domain", "value": "api.github.com", "port": 443}]}, 1000)
@@ -248,28 +249,56 @@ def test_root_helper_bounds_all_commands_and_can_send_nft_batch_stdin(monkeypatc
 
 
 def test_proxy_log_setup_rejects_symlink_before_chown(monkeypatch, tmp_path):
-    from pathlib import Path
-    from types import SimpleNamespace
     helper = _helper_module()
     logdir = tmp_path / "logs"
-    logdir.mkdir()
+    logdir.mkdir(mode=0o750)
     target = tmp_path / "sensitive"
     target.write_text("preserve")
     (logdir / "vm.cache.log").symlink_to(target)
     monkeypatch.setattr(helper, "LOG", logdir)
-    monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: type("Account", (), {"pw_uid": 1, "pw_gid": 1})())
-    monkeypatch.setattr(helper.os, "chown", lambda *_args: None)
-    monkeypatch.setattr(helper.os, "chmod", lambda *_args: None)
-    original_lstat = Path.lstat
-    def root_owned_logdir(path):
-        result = original_lstat(path)
-        if path == logdir:
-            return SimpleNamespace(st_mode=result.st_mode, st_uid=0)
-        return result
-    monkeypatch.setattr(Path, "lstat", root_owned_logdir)
+    account = type("Account", (), {"pw_uid": os.getuid(), "pw_gid": os.getgid()})()
+    monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: account)
+    monkeypatch.setattr(helper.os, "fchown", lambda *_args: None)
     with pytest.raises(helper.Error, match="log do proxy inseguro"):
         helper.prepare_logs("vm")
     assert target.read_text() == "preserve"
+
+
+def test_proxy_log_setup_adopts_legacy_proxy_owned_directory_safely(monkeypatch, tmp_path):
+    helper = _helper_module()
+    logdir = tmp_path / "logs"
+    logdir.mkdir(mode=0o750)
+    logdir.chmod(0o750)
+    previous = logdir / "u1000-old.cache.log"
+    previous.write_text("preserve prior log contents\n")
+    previous.chmod(0o640)
+    monkeypatch.setattr(helper, "LOG", logdir)
+    account = type("Account", (), {"pw_uid": os.getuid(), "pw_gid": os.getgid()})()
+    monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: account)
+    fchown_calls = []
+
+    def capture_fchown(fd, uid, gid):
+        fchown_calls.append((helper.stat.S_ISDIR(helper.os.fstat(fd).st_mode), uid, gid))
+
+    monkeypatch.setattr(helper.os, "fchown", capture_fchown)
+    helper.prepare_logs("new-vm")
+    assert fchown_calls[0] == (True, 0, account.pw_gid)
+    assert previous.read_text() == "preserve prior log contents\n"
+    assert (logdir.stat().st_mode & 0o777) == 0o750
+    assert (logdir / "new-vm.cache.log").stat().st_mode & 0o777 == 0o640
+    assert (logdir / "new-vm.access.log").stat().st_mode & 0o777 == 0o640
+
+
+def test_proxy_log_setup_rejects_directory_owned_by_unknown_user(monkeypatch, tmp_path):
+    helper = _helper_module()
+    logdir = tmp_path / "logs"
+    logdir.mkdir(mode=0o750)
+    monkeypatch.setattr(helper, "LOG", logdir)
+    account = type("Account", (), {"pw_uid": os.getuid() + 1, "pw_gid": os.getgid()})()
+    monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: account)
+    monkeypatch.setattr(helper.os, "fchown", lambda *_args: pytest.fail("unknown owner must fail before chown"))
+    with pytest.raises(helper.Error, match="diretório de logs do proxy inseguro"):
+        helper.prepare_logs("vm")
 
 
 def test_domain_proxy_rules_require_live_resolution_and_reject_any_non_global_answer():
@@ -299,6 +328,36 @@ def test_squid_instances_get_distinct_alphanumeric_service_names():
     assert helper.squid_service_name("u1000-locked-vm") == first
     with pytest.raises(helper.Error, match="identificador de serviço"):
         helper.squid_service_name("../../squid")
+
+
+def test_proxy_readiness_requires_the_expected_default_deny_response(monkeypatch):
+    from types import SimpleNamespace
+    import io
+
+    helper = _helper_module()
+    requests = []
+
+    class FakeConnection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def settimeout(self, _timeout): pass
+        def sendall(self, payload): requests.append(payload)
+        def makefile(self, *_args): return io.BytesIO(b"HTTP/1.1 403 Forbidden\r\n")
+
+    monkeypatch.setattr(helper, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout="active"))
+    monkeypatch.setattr(helper.socket, "create_connection", lambda *_args, **_kwargs: FakeConnection())
+    helper.wait_for_proxy("u1000-locked-vm", "10.0.0.1", 20200)
+    assert requests == [b"CONNECT isolatevm-healthcheck.invalid:443 HTTP/1.1\r\n"
+                        b"Host: isolatevm-healthcheck.invalid:443\r\n"
+                        b"Connection: close\r\n\r\n"]
+
+    class WrongProxy(FakeConnection):
+        def makefile(self, *_args): return io.BytesIO(b"HTTP/1.1 200 OK\r\n")
+
+    monkeypatch.setattr(helper.socket, "create_connection", lambda *_args, **_kwargs: WrongProxy())
+    with pytest.raises(helper.Error, match="negação padrão"):
+        helper.wait_for_proxy("u1000-locked-vm", "10.0.0.1", 20200)
 
 
 def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(request):
@@ -514,7 +573,7 @@ def test_removing_last_domain_policy_deletes_both_firewall_tables_in_one_transac
 @pytest.mark.parametrize("failed_stage", [
     "ensure_bridge_netfilter", "ensure_firewall_guard",
     "unit:stop", "unit:disable", "prepare_logs", "write_config", "save_state",
-    "apply_nft", "unit:enable", "unit:restart",
+    "apply_nft", "unit:enable", "unit:restart", "wait_for_proxy",
 ])
 def test_failed_policy_apply_leaves_proxy_stopped_and_disabled_for_retry(monkeypatch, failed_stage):
     helper = _helper_module()
@@ -537,7 +596,7 @@ def test_failed_policy_apply_leaves_proxy_stopped_and_disabled_for_retry(monkeyp
         return run
 
     for name in ("ensure_bridge_netfilter", "ensure_firewall_guard", "prepare_logs",
-                 "write_config", "save_state", "apply_nft"):
+                 "write_config", "save_state", "apply_nft", "wait_for_proxy"):
         monkeypatch.setattr(helper, name, stage(name))
 
     def unit(_service, action):
@@ -552,6 +611,103 @@ def test_failed_policy_apply_leaves_proxy_stopped_and_disabled_for_retry(monkeyp
                       "network_mode": "restricted",
                       "rules": [{"kind": "domain", "value": "api.github.com", "port": 443}]}, 1000)
     assert events[-2:] == ["unit:stop", "unit:disable"]
+
+
+def test_failed_first_policy_apply_removes_new_empty_boot_guard(monkeypatch):
+    helper = _helper_module()
+    monkeypatch.setattr(helper, "bridge_info", lambda *_args: ("10.0.0.1", helper.ipaddress.ip_network("10.0.0.0/24")))
+    monkeypatch.setattr(helper, "state", lambda: {})
+    monkeypatch.setattr(helper, "lease_addresses", lambda _bridge, _uid: set())
+    monkeypatch.setattr(helper, "firewall_guard_preexisting", lambda: False)
+    events = []
+    monkeypatch.setattr(helper, "ensure_bridge_netfilter", lambda: events.append("br_netfilter"))
+    monkeypatch.setattr(helper, "ensure_firewall_guard", lambda: events.append("install_guard"))
+    monkeypatch.setattr(helper, "prepare_logs", lambda _name: (_ for _ in ()).throw(helper.Error("injected failure")))
+    monkeypatch.setattr(helper, "unit", lambda _service, action: events.append(f"proxy:{action}"))
+    monkeypatch.setattr(helper, "remove_firewall_guard", lambda: events.append("remove_guard"))
+    with pytest.raises(helper.Error, match="injected failure"):
+        helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
+                      "network_mode": "restricted",
+                      "rules": [{"kind": "domain", "value": "github.com", "port": 443}]}, 1000)
+    assert events.count("remove_guard") == 1
+    assert events.index("install_guard") < events.index("remove_guard")
+
+
+def test_failed_policy_apply_keeps_boot_guard_when_persisted_state_remains(monkeypatch):
+    helper = _helper_module()
+    record = {"bridge": "incusbr-1000", "network_mode": "restricted",
+              "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+              "mac": "02:00:00:00:00:01", "rules": [{"kind": "domain", "value": "github.com", "port": 443}],
+              "owner_uid": 1000, "name": "locked-vm", "service_name": "u1000-locked-vm"}
+    current = {"u1000-locked-vm": record.copy()}
+    monkeypatch.setattr(helper, "bridge_info", lambda *_args: ("10.0.0.1", helper.ipaddress.ip_network("10.0.0.0/24")))
+    monkeypatch.setattr(helper, "state", lambda: dict(current))
+    monkeypatch.setattr(helper, "lease_addresses", lambda _bridge, _uid: set())
+    monkeypatch.setattr(helper, "firewall_guard_preexisting", lambda: False)
+    monkeypatch.setattr(helper, "ensure_bridge_netfilter", lambda: None)
+    monkeypatch.setattr(helper, "ensure_firewall_guard", lambda: None)
+    monkeypatch.setattr(helper, "stop_disable_proxy", lambda _name: None)
+    monkeypatch.setattr(helper, "prepare_logs", lambda _name: None)
+    monkeypatch.setattr(helper, "write_config", lambda *_args: None)
+    monkeypatch.setattr(helper, "save_state", lambda value: current.update(value))
+    monkeypatch.setattr(helper, "apply_nft", lambda _data: (_ for _ in ()).throw(helper.Error("nft failure")))
+    monkeypatch.setattr(helper, "unit", lambda *_args: None)
+    monkeypatch.setattr(helper, "best_effort_stop_disable_proxy", lambda _name: None)
+    removed = []
+    monkeypatch.setattr(helper, "remove_firewall_guard", lambda: removed.append(True))
+    with pytest.raises(helper.Error, match="nft failure"):
+        helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
+                      "network_mode": "restricted",
+                      "rules": [{"kind": "domain", "value": "github.com", "port": 443}]}, 1000)
+    assert current["u1000-locked-vm"]["name"] == record["name"]
+    assert current["u1000-locked-vm"]["service_name"] == record["service_name"]
+    assert removed == []
+
+
+def test_failed_first_policy_apply_cleans_partial_state_when_vm_is_absent(monkeypatch, tmp_path):
+    helper = _helper_module()
+    current = {}
+    removed_guard = []
+    monkeypatch.setattr(helper, "bridge_info", lambda *_args: ("10.0.0.1", helper.ipaddress.ip_network("10.0.0.0/24")))
+    monkeypatch.setattr(helper, "state", lambda: dict(current))
+    monkeypatch.setattr(helper, "lease_addresses", lambda _bridge, _uid: set())
+    monkeypatch.setattr(helper, "firewall_guard_preexisting", lambda: False)
+    monkeypatch.setattr(helper, "instance_exists", lambda _name, _uid: False)
+    monkeypatch.setattr(helper, "ensure_bridge_netfilter", lambda: None)
+    monkeypatch.setattr(helper, "ensure_firewall_guard", lambda: None)
+    monkeypatch.setattr(helper, "stop_disable_proxy", lambda _name: None)
+    monkeypatch.setattr(helper, "prepare_logs", lambda _name: None)
+    monkeypatch.setattr(helper, "write_config", lambda *_args: None)
+    monkeypatch.setattr(helper, "save_state", lambda value: (current.clear(), current.update(value)))
+    monkeypatch.setattr(helper, "apply_nft", lambda _data: None)
+    monkeypatch.setattr(helper, "CONFIG", tmp_path / "config")
+    monkeypatch.setattr(helper, "LOG", tmp_path / "logs")
+    monkeypatch.setattr(helper, "unit", lambda _service, action: (_ for _ in ()).throw(helper.Error("restart failure"))
+                        if action == "restart" else None)
+    monkeypatch.setattr(helper, "best_effort_stop_disable_proxy", lambda _name: None)
+    monkeypatch.setattr(helper, "remove_firewall_guard", lambda: removed_guard.append(True))
+    with pytest.raises(helper.Error, match="restart failure"):
+        helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
+                      "network_mode": "restricted",
+                      "rules": [{"kind": "domain", "value": "github.com", "port": 443}]}, 1000,
+                     guard_preexisting_override=False)
+    assert current == {}
+    assert removed_guard == [True]
+
+
+def test_egress_remove_preserves_policy_while_scoped_vm_still_exists(monkeypatch):
+    helper = _helper_module()
+    record = {"bridge": "incusbr-1000", "network_mode": "restricted",
+              "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+              "mac": "02:00:00:00:00:01", "rules": [{"kind": "domain", "value": "github.com", "port": 443}],
+              "owner_uid": 1000, "name": "locked-vm", "service_name": "u1000-locked-vm"}
+    monkeypatch.setattr(helper, "state", lambda: {"u1000-locked-vm": record})
+    monkeypatch.setattr(helper, "instance_exists", lambda _name, _uid: True)
+    stopped = []
+    monkeypatch.setattr(helper, "stop_disable_proxy", lambda name: stopped.append(name))
+    with pytest.raises(helper.Error, match="VM ainda existe"):
+        helper.remove({"version": 1, "name": "locked-vm"}, 1000)
+    assert stopped == []
 
 
 def test_successful_policy_apply_disables_old_listener_until_firewall_is_replaced(monkeypatch):
@@ -571,6 +727,7 @@ def test_successful_policy_apply_disables_old_listener_until_firewall_is_replace
     monkeypatch.setattr(helper, "write_config", lambda *_args: events.append("config"))
     monkeypatch.setattr(helper, "save_state", lambda _data: events.append("state"))
     monkeypatch.setattr(helper, "apply_nft", lambda _data: events.append("firewall"))
+    monkeypatch.setattr(helper, "wait_for_proxy", lambda *_args: events.append("listener"))
     helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
                   "network_mode": "restricted",
                   "rules": [{"kind": "domain", "value": "api.github.com", "port": 443}]}, 1000)

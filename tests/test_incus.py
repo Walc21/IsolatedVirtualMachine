@@ -135,6 +135,88 @@ def test_mock_persistent_workspace_rejects_host_mount_overlap(tmp_path, monkeypa
             service.add_mount("dev-vm", Mount(str(folder), guest, "ro"))
 
 
+@pytest.mark.parametrize("candidate_dir,guest_path,error", [
+    ("nested", "/other", "Pastas do host"),
+    ("separate", "/workspace/data", "Destinos de mount"),
+])
+def test_manifest_and_incremental_mount_share_host_and_guest_overlap_rules(
+        tmp_path, monkeypatch, candidate_dir, guest_path, error):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "project"; root.mkdir()
+    nested = root / "nested"; nested.mkdir()
+    separate = tmp_path / "separate"; separate.mkdir()
+    candidate = nested if candidate_dir == "nested" else separate
+    first = {"host": str(root), "guest": "/workspace", "mode": "ro"}
+    second = {"host": str(candidate), "guest": guest_path, "mode": "ro"}
+    manifest_raw = sample().to_dict()
+    manifest_raw["mounts"] = [first, second]
+    with pytest.raises(ValidationError, match=error):
+        Manifest.parse(manifest_raw)
+
+    initial = sample().to_dict()
+    initial["mounts"] = [first]
+    service = MockIncus(); service.create(Manifest.parse(initial))
+    with pytest.raises(ValidationError, match=error):
+        service.add_mount("dev-vm", Mount(str(candidate), guest_path, "ro"))
+
+
+def test_incremental_mount_refuses_overlap_with_an_incus_data_volume(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    folder = tmp_path / "project"; folder.mkdir()
+    service = MockIncus(); service.create(sample())
+    service.create_data_volume("dev-vm", "default", "project-data", 4, "/data")
+    with pytest.raises(ValidationError, match="sobrepõe"):
+        service.add_mount("dev-vm", Mount(str(folder), "/data/nested", "ro"))
+
+
+def test_local_add_mount_uses_canonical_overlap_rules_and_fails_closed_on_missing_copy_manifest(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "project"; root.mkdir()
+    nested = root / "nested"; nested.mkdir()
+    another = tmp_path / "another"; another.mkdir()
+    service = LocalIncus.__new__(LocalIncus)
+    service.effective = lambda _name: {
+        "security_profile": "custom",
+        "mounts": [{"source": str(root), "path": "/workspace", "mode": "RO"}],
+        "volumes": [],
+        "config": {"devices": {"isovm0": {"type": "disk", "path": "/workspace"}}},
+    }
+    service._security_profile = lambda _name: "custom"
+    service._local_instance_config = lambda _name: {"config": {"user.isolatevm.copy-state": "none"}}
+    service._check_host_mount_policy = lambda _mounts: None
+    calls = []; service._run = lambda *args, **kwargs: calls.append(args)
+    with pytest.raises(ValidationError, match="Pastas do host"):
+        service.add_mount("dev-vm", Mount(str(nested), "/other", "ro"))
+    assert calls == []
+
+    service.effective = lambda _name: {
+        "security_profile": "custom", "mounts": [], "volumes": [],
+        "config": {"devices": {"root": {"type": "disk", "path": "/"}}},
+    }
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.copy-state": "pending"}}
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest",
+                        lambda _name: (_ for _ in ()).throw(ValidationError("missing")))
+    with pytest.raises(IncusError, match="Manifesto de cópia.*indisponível"):
+        service.add_mount("dev-vm", Mount(str(another), "/other", "ro"))
+    assert calls == []
+
+    source = tmp_path / "copy-source"; source.mkdir()
+    (source / "note.txt").write_text("synthetic")
+    manifest_raw = sample().to_dict()
+    manifest_raw["copies"] = [{"host": str(source), "guest": "/home/ubuntu/work/imported",
+                               "kind": "directory", "includeHidden": False}]
+    copies = Manifest.parse(manifest_raw).copies
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest",
+                        lambda _name: SimpleNamespace(copies=copies))
+    with pytest.raises(ValidationError, match="Cópia: destino se sobrepõe"):
+        service.add_mount("dev-vm", Mount(str(another), "/home/ubuntu/work", "ro"))
+    assert calls == []
+
+
 def test_clone_resets_disposable_disposition():
     raw = sample().to_dict()
     raw["lifecycle"] = {"disposition": "delete-on-close"}
@@ -149,7 +231,8 @@ def test_local_clone_resets_lifecycle_and_removes_partial_clone_on_config_failur
     service = LocalIncus.__new__(LocalIncus)
     service.list_vms = lambda: []
     service._local_instance_config = lambda _name: {
-        "config": {"user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
+        "config": {"user.isolatevm.managed": "true",
+                   "user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
     calls = []
     def run(*args, **kwargs):
         calls.append(args)
@@ -163,6 +246,23 @@ def test_local_clone_resets_lifecycle_and_removes_partial_clone_on_config_failur
         ("config", "set", "clone-vm", "user.isolatevm.lifecycle-disposition=persistent"),
         ("delete", "clone-vm", "--force"),
     ]
+
+
+def test_local_clone_preserves_uncertain_target_when_copy_command_fails():
+    service = LocalIncus.__new__(LocalIncus)
+    service.list_vms = lambda: [VM("source-vm", "Stopped", "2", "2048MiB", "20GiB", "—", "Ubuntu", 0)]
+    service._local_instance_config = lambda _name: {
+        "config": {"user.isolatevm.managed": "true",
+                   "user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("copy", "source-vm"):
+            raise IncusError("timeout after request")
+    service._run = run
+    with pytest.raises(IncusError, match="Resultado da criação.*incerto.*preservados"):
+        service.clone("source-vm", "clone-vm")
+    assert calls == [("copy", "source-vm", "clone-vm")]
 
 
 def test_local_workspace_clone_copies_volume_and_rewires_cloned_vm():
@@ -205,6 +305,8 @@ def test_local_delete_removes_verified_workspace_after_vm():
                    "user.isolatevm.lifecycle-disposition": "persist-workspace",
                    "user.isolatevm.workspace-volume": volume}, "profiles": []}
     service._verify_workspace_device = lambda name, local: ("default", volume)
+    service._verify_workspace_volume = lambda pool, vol, owner, size=None: {
+        "config": {"user.isolatevm.owner": owner, "user.isolatevm.size-gib": "20"}}
     calls = []
     service._run = lambda *args, **kwargs: calls.append(args)
     service.delete("dev-vm")
@@ -308,6 +410,17 @@ def test_local_delete_refuses_unverified_data_volume_without_deleting_vm():
     assert calls == []
 
 
+def test_local_delete_refuses_vm_without_isolatevm_ownership_marker():
+    service = LocalIncus.__new__(LocalIncus)
+    service._security_profile = lambda _name: "maximum-isolation"
+    service._local_instance_config = lambda _name: {"config": {}, "profiles": []}
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    with pytest.raises(IncusError, match="Propriedade da VM.*nada foi excluído"):
+        service.delete("external-vm")
+    assert calls == []
+
+
 def test_local_data_volume_export_verifies_stopped_vm_and_writes_private_new_archive(tmp_path):
     service = LocalIncus.__new__(LocalIncus)
     service._require_stopped_vm = lambda _name: None
@@ -344,7 +457,8 @@ def test_local_clone_reports_orphan_when_persistent_reset_and_cleanup_fail():
     service = LocalIncus.__new__(LocalIncus)
     service.list_vms = lambda: []
     service._local_instance_config = lambda _name: {
-        "config": {"user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
+        "config": {"user.isolatevm.managed": "true",
+                   "user.isolatevm.lifecycle-disposition": "persistent"}, "profiles": []}
     def run(*args, **kwargs):
         if args[:1] == ("copy",): return
         raise IncusError("denied")
@@ -445,6 +559,27 @@ def test_provisioning_status_reads_guest_without_leaking_error_details():
                       {"timeout": 30, "ok_returncodes": (0, 1, 2),
                        "output_limit_bytes": 1_000_000})]
     with pytest.raises(ValidationError): service.provisioning_status("bad;name")
+
+
+def test_rustup_inventory_limits_untrusted_guest_output(monkeypatch):
+    raw = sample().to_dict()
+    raw["software"] = {"apt": ["rustup"]}
+    manifest = Manifest.parse(raw)
+    service = LocalIncus.__new__(LocalIncus)
+    service._require_connection_approval = lambda: None
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return ("rustc 1.85.1 (4eb161250 2025-03-15)\n"
+                if any("rustc" in value for value in args) else "")
+
+    service._run = run
+    monkeypatch.setattr("isolatevm.incus.load_instance_manifest", lambda _name: manifest)
+    entries = service.software_inventory("dev-vm")
+    rustc_call = next(call for call in calls if any("rustc" in value for value in call[0]))
+    assert rustc_call[1]["output_limit_bytes"] == 4096
+    assert any(entry.manager == "rustup" and entry.status == "installed" for entry in entries)
 
 
 def test_snapshot_rename_uses_fixed_cli_operation():
@@ -982,13 +1117,15 @@ def test_local_usb_refuses_stale_selection(monkeypatch):
     assert calls == []
 
 
-def test_local_gpu_uses_only_pci_and_managed_slot():
+def test_local_gpu_uses_only_pci_and_managed_slot(monkeypatch):
     service = LocalIncus.__new__(LocalIncus)
     service._security_profile = lambda name: "custom"
     service.list_vms = lambda: [VM("dev-vm", "Stopped", "2", "2GiB", "20GiB", "—", "Ubuntu", 0)]
     service._local_devices = lambda name: {}
     calls = []; service._run = lambda *args, **kwargs: calls.append(args)
-    service.add_gpu_device("dev-vm", GpuDevice("0000:01:00.0", "10de", "1f91", "GPU"))
+    selected = GpuDevice("0000:01:00.0", "10de", "1f91", "GPU")
+    monkeypatch.setattr("isolatevm.incus.host_gpu_devices", lambda: [selected])
+    service.add_gpu_device("dev-vm", selected)
     assert calls == [("config", "device", "add", "dev-vm", "isogpu0", "gpu", "gputype=physical", "pci=0000:01:00.0", "vendorid=10de", "productid=1f91")]
     service._security_profile = lambda name: "maximum-isolation"
     with pytest.raises(ValidationError, match="Máximo isolamento"):
@@ -1136,6 +1273,44 @@ def test_preflight_refuses_offline_cpu_ids_before_creation():
     service.image_info = lambda release: pytest.fail("offline CPU IDs must fail before image lookup")
     with pytest.raises(IncusError, match="não estão online"):
         service.preflight(manifest)
+
+
+def test_gpu_passthrough_reenumerates_and_rejects_stale_identity(monkeypatch):
+    from isolatevm.gpu import GpuDevice
+
+    service = LocalIncus.__new__(LocalIncus)
+    service._security_profile = lambda _name: "restricted-development"
+    service._require_stopped_vm = lambda _name: None
+    service._local_devices = lambda _name: {"root": {"type": "disk"}}
+    selected = GpuDevice("0000:01:00.0", "10de", "2684", "GPU PCI 0000:01:00.0")
+    calls = []
+    service._run = lambda *args, **kwargs: calls.append(args)
+    monkeypatch.setattr("isolatevm.incus.host_gpu_devices", lambda: [selected])
+    service.add_gpu_device("dev-vm", selected)
+    assert calls == [("config", "device", "add", "dev-vm", "isogpu0", "gpu",
+                      "gputype=physical", "pci=0000:01:00.0", "vendorid=10de",
+                      "productid=2684")]
+
+    calls.clear()
+    monkeypatch.setattr("isolatevm.incus.host_gpu_devices", lambda: [
+        GpuDevice("0000:01:00.0", "10de", "1f91", "GPU PCI 0000:01:00.0")])
+    with pytest.raises(ValidationError, match="GPU mudou desde a seleção"):
+        service.add_gpu_device("dev-vm", selected)
+    assert calls == []
+
+
+def test_gpu_passthrough_rejects_disappeared_device_before_incus_mutation(monkeypatch):
+    from isolatevm.gpu import GpuDevice
+
+    service = LocalIncus.__new__(LocalIncus)
+    service._security_profile = lambda _name: "restricted-development"
+    service._require_stopped_vm = lambda _name: None
+    service._local_devices = lambda _name: {"root": {"type": "disk"}}
+    service._run = lambda *_args, **_kwargs: pytest.fail("stale GPU must not reach Incus")
+    monkeypatch.setattr("isolatevm.incus.host_gpu_devices", lambda: [])
+    selected = GpuDevice("0000:01:00.0", "10de", "2684", "GPU PCI 0000:01:00.0")
+    with pytest.raises(ValidationError, match="GPU mudou desde a seleção"):
+        service.add_gpu_device("dev-vm", selected)
 
 
 def test_creation_applies_explicit_cpu_pin_range():

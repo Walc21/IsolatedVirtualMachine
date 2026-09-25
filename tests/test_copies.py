@@ -59,6 +59,17 @@ def test_copy_manifest_round_trip_and_saved_source_can_disappear(tmp_path, monke
         Manifest.from_yaml(manifest.to_yaml())
 
 
+def test_incremental_mount_cannot_overlap_one_time_copy_destination(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    source = tmp_path / "source"; source.mkdir()
+    (source / "note.txt").write_text("synthetic")
+    project = tmp_path / "project"; project.mkdir()
+    manifest = Manifest.parse(raw(source, destination="/home/ubuntu/work/imported"))
+    service = MockIncus(); service.create(manifest)
+    with pytest.raises(ValidationError, match="Cópia: destino se sobrepõe"):
+        service.add_mount("copy-vm", Mount(str(project), "/home/ubuntu/work", "ro"))
+
+
 def test_copy_source_rejects_hidden_sensitive_symlink_and_overlap(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     source = tmp_path / "project"

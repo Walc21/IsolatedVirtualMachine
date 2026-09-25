@@ -270,8 +270,8 @@ def flow():
     window = app.get_active_window()
     window.stack.set_visible_child_name("wizard")
     window.catalog_checks["curl"].set_active(True)
-    for package in ("@openai/codex@latest", "@anthropic-ai/claude-code@latest",
-                    "aider-chat==0.86.2", "opencode-ai@latest"):
+    for package in ("@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276",
+                    "aider-chat==0.86.2", "opencode-ai@1.18.31"):
         window.ai_coding_checks[package].set_active(True)
     for _ in range(11): window._next()
     assert window.current_manifest is not None
@@ -279,7 +279,7 @@ def flow():
     assert window.current_manifest.desktop is None
     assert "curl" in window.current_manifest.apt
     assert set(window.current_manifest.npm) == {
-        "@openai/codex@latest", "@anthropic-ai/claude-code@latest", "opencode-ai@latest"}
+        "@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276", "opencode-ai@1.18.31"}
     assert window.current_manifest.pipx == ("aider-chat==0.86.2",)
     window._next()
     assert window.wizard_step == 12
@@ -451,8 +451,8 @@ def flow():
                           {"host": str(second), "guest": "/datasets", "mode": "ro"}],
                "software": {"apt": ["git", "postgresql-client", "golang-go", "pipx", "docker.io", "python3", "python3-pip", "dotnet-sdk-10.0"],
                             "pipx": ["uv==0.12.18", "poetry==2.5.1", "aider-chat==0.86.2"],
-                            "npm": ["bun@1.4.2", "@pnpm/exe@12.5.1", "@openai/codex@latest",
-                                    "@anthropic-ai/claude-code@latest", "opencode-ai@latest"],
+                            "npm": ["bun@1.4.2", "@pnpm/exe@12.5.1", "@openai/codex@0.154.0",
+                                    "@anthropic-ai/claude-code@2.1.276", "opencode-ai@1.18.31"],
                             "external": ["helm@community", "terraform@hashicorp", "kubectl@1.37"],
                             "cargo": ["ripgrep@14.1.1"], "go": ["golang.org/x/tools/gopls@v0.20.0"]},
                "environment": {"NODE_ENV": "development"}}
@@ -470,10 +470,10 @@ def flow():
             assert window.catalog_checks["external:helm@community"].get_active()
             assert window.catalog_checks["external:terraform@hashicorp"].get_active()
             assert window.catalog_checks["external:kubectl@1.37"].get_active()
-            assert window.ai_coding_checks["@openai/codex@latest"].get_active()
-            assert window.ai_coding_checks["@anthropic-ai/claude-code@latest"].get_active()
+            assert window.ai_coding_checks["@openai/codex@0.154.0"].get_active()
+            assert window.ai_coding_checks["@anthropic-ai/claude-code@2.1.276"].get_active()
             assert window.ai_coding_checks["aider-chat==0.86.2"].get_active()
-            assert window.ai_coding_checks["opencode-ai@latest"].get_active()
+            assert window.ai_coding_checks["opencode-ai@1.18.31"].get_active()
             assert window.dotnet10_check.get_active()
             assert window.python_check.get_active()
             assert window.cargo_input.get_text() == "ripgrep@14.1.1"

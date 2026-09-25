@@ -33,7 +33,7 @@ cp "$project_dir/packaging/isolatevm-egress-firewall.service" "$stage_dir/usr/li
 cp "$project_dir/packaging/org.isolatevm.egress.policy" "$stage_dir/usr/share/polkit-1/actions/"
 cat > "$stage_dir/DEBIAN/control" <<'EOF'
 Package: isolatevm
-Version: 0.3.8
+Version: 0.3.9
 Section: admin
 Priority: optional
 Architecture: all
@@ -87,4 +87,4 @@ chmod 0755 "$stage_dir/usr/bin/isolatevm"
 chmod 0755 "$stage_dir/usr/lib/isolatevm/isolatevm-egress-helper"
 chmod 0755 "$stage_dir/DEBIAN/prerm"
 chmod 0755 "$stage_dir/DEBIAN/postinst"
-dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.8_all.deb"
+dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.9_all.deb"

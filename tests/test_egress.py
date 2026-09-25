@@ -1,4 +1,9 @@
 import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
 
 import pytest
 
@@ -94,20 +99,20 @@ def test_firewall_replacement_uses_one_transaction_and_rejects_nft_injection(mon
 
     def run(*args, input_text=None, check=True):
         calls.append((args, input_text, check))
-        if args[:3] == ("/usr/sbin/nft", "list", "table"):
+        if args[:5] == ("/usr/sbin/nft", "list", "table", "bridge", "isolatevm_egress"):
             return SimpleNamespace(returncode=0, stdout="table exists", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(helper, "run", run)
     helper.apply_nft({"u1000-vm": {"mac": "02:00:00:00:00:01", "address": "10.0.0.200",
                                    "gateway": "10.0.0.1", "port": 20200}})
-    assert len(calls) == 3
-    assert calls[1][0] == ("/usr/sbin/nft", "--check", "--file", "-")
-    assert calls[2][0] == ("/usr/sbin/nft", "--file", "-")
-    assert calls[1][1].startswith("delete table bridge isolatevm_egress\n")
-    assert calls[1][1] == calls[2][1]
+    assert len(calls) == 4
+    assert calls[2][0] == ("/usr/sbin/nft", "--check", "--file", "-")
+    assert calls[3][0] == ("/usr/sbin/nft", "--file", "-")
+    assert calls[2][1].startswith("delete table bridge isolatevm_egress\n")
+    assert calls[2][1] == calls[3][1]
     assert not any(call[0][1:3] == ("delete", "table") for call in calls)
-    forward = calls[1][1].split("chain input", 1)[0]
+    forward = calls[2][1].split("chain input", 1)[0]
     assert "ether saddr 02:00:00:00:00:01 drop" in forward
     assert "arp accept" not in forward and "udp dport 67 accept" not in forward
     bad = {"vm": {"mac": "02:00:00:00:00:01; flush ruleset", "address": "10.0.0.200",
@@ -138,6 +143,45 @@ def test_helper_bounds_request_json_and_rejects_duplicate_keys(monkeypatch):
         b" " * (helper.MAX_REQUEST_BYTES + 1)), encoding="utf-8"))
     with pytest.raises(helper.Error, match="limite"):
         helper.load_json()
+
+
+def test_privileged_state_rejects_duplicate_json_fields(monkeypatch, tmp_path):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import stat
+
+    helper = _helper_module()
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    state_path = root / "state.json"
+    state_path.write_text('{"u1000-vm":{"owner_uid":1000,"owner_uid":2000}}')
+    monkeypatch.setattr(helper, "ROOT", root)
+    monkeypatch.setattr(helper, "STATE", state_path)
+    original_lstat = Path.lstat
+    def root_as_system_directory(path):
+        result = original_lstat(path)
+        if path == root:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=0)
+        return result
+    monkeypatch.setattr(Path, "lstat", root_as_system_directory)
+    original_fstat = helper.os.fstat
+    def root_owned_state(fd):
+        result = original_fstat(fd)
+        if fd == state_fd[0]:
+            return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0,
+                                   st_nlink=1, st_size=result.st_size)
+        return result
+    state_fd = []
+    original_open = helper.os.open
+    def record_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        if args[0] == state_path:
+            state_fd.append(fd)
+        return fd
+    monkeypatch.setattr(helper.os, "open", record_open)
+    monkeypatch.setattr(helper.os, "fstat", root_owned_state)
+    with pytest.raises(helper.Error, match="campos duplicados"):
+        helper.state()
 
 
 def test_policy_update_stops_the_old_proxy_before_replacing_its_acl(monkeypatch):
@@ -190,6 +234,19 @@ def test_root_helper_bounds_subprocess_capture():
                            output_limit_bytes=128)
 
 
+def test_root_helper_bounds_all_commands_and_can_send_nft_batch_stdin(monkeypatch):
+    helper = _helper_module()
+    monkeypatch.setattr(helper, "MAX_COMMAND_OUTPUT_BYTES", 128)
+    with pytest.raises(helper.Error, match="excedeu o limite"):
+        helper.run(helper.sys.executable, "-c", "print('x' * 10000)")
+    result = helper.run(helper.sys.executable, "-c",
+                        "import sys; print(sys.stdin.read())", input_text="nft batch")
+    assert result.returncode == 0 and result.stdout == "nft batch\n"
+    monkeypatch.setattr(helper, "MAX_COMMAND_INPUT_BYTES", 8)
+    with pytest.raises(helper.Error, match="entrada do comando excedeu"):
+        helper.run(helper.sys.executable, "-c", "pass", input_text="x" * 9)
+
+
 def test_proxy_log_setup_rejects_symlink_before_chown(monkeypatch, tmp_path):
     from pathlib import Path
     from types import SimpleNamespace
@@ -213,3 +270,310 @@ def test_proxy_log_setup_rejects_symlink_before_chown(monkeypatch, tmp_path):
     with pytest.raises(helper.Error, match="log do proxy inseguro"):
         helper.prepare_logs("vm")
     assert target.read_text() == "preserve"
+
+
+def test_domain_proxy_rules_require_live_resolution_and_reject_any_non_global_answer():
+    helper = _helper_module()
+    config = helper.squid_config("u1000-locked-vm", "10.0.0.200", "10.0.0.1", 20200,
+                                 [{"kind": "domain", "value": "github.com", "port": 443}])
+    assert "acl destination_has_ipv4_address dst 0.0.0.0/0" in config
+    assert "acl destination_has_ipv6_address dst ::/0" in config
+    assert "acl non_global_destination dst " in config
+    assert "acl destination_0 dstdomain -n github.com" in config
+    assert f"tcp_outgoing_mark {helper.DOMAIN_EGRESS_MARK} vm_source destination_0" in config
+    assert ("http_access allow vm_source destination_0 destination_port_0 "
+            "destination_has_ipv4_address !destination_has_ipv6_address "
+            "!non_global_destination") in config
+    for address in ("127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
+                    "224.0.0.0/4", "240.0.0.0/4"):
+        assert address in helper.NON_GLOBAL_DESTINATIONS
+
+
+def test_squid_instances_get_distinct_alphanumeric_service_names():
+    helper = _helper_module()
+    first = helper.squid_service_name("u1000-locked-vm")
+    second = helper.squid_service_name("u1000-other-vm")
+    assert first.startswith("ivm") and first.isalnum()
+    assert second.startswith("ivm") and second.isalnum()
+    assert first != second
+    assert helper.squid_service_name("u1000-locked-vm") == first
+    with pytest.raises(helper.Error, match="identificador de serviço"):
+        helper.squid_service_name("../../squid")
+
+
+def test_squid_domain_acl_checks_public_private_mixed_and_rebound_answers(request):
+    from pathlib import Path
+
+    helper = _helper_module()
+    squid = Path("/usr/sbin/squid")
+    assert squid.is_file(), "install squid to run the restricted-domain ACL integration test"
+    root = Path(tempfile.mkdtemp(prefix="isolatevm-squid-acl-", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        proxy_port = reservation.getsockname()[1]
+
+    root.chmod(0o755)
+    hosts = root / "hosts"
+    hosts.write_text("8.8.8.8 target.example\n", encoding="ascii")
+    hosts.chmod(0o644)
+    config = root / "squid.conf"
+    lines = helper.squid_config(
+        "u1000-test", "10.0.0.200", "10.0.0.1", 20200,
+        [{"kind": "domain", "value": "target.example", "port": 80}],
+    ).splitlines()
+    rewritten = []
+    for line in lines:
+        if line.startswith("http_port "):
+            line = f"http_port 127.0.0.1:{proxy_port}"
+        elif line.startswith("acl vm_source src "):
+            line = "acl vm_source src 127.0.0.1"
+        elif line.startswith("cache_log "):
+            line = f"cache_log {root / 'squid.cache.log'}"
+        elif line.startswith("access_log "):
+            line = "access_log stdio:/dev/null"
+        elif line == "pid_filename none":
+            line = f"pid_filename {root / 'squid.pid'}"
+        rewritten.append(line)
+    config.write_text(
+        f"hosts_file {hosts}\nconnect_timeout 1 seconds\n"
+        "debug_options ALL,1 33,2 28,9\n" + "\n".join(rewritten) + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o644)
+    service_name = helper.squid_service_name("u1000-test")
+    parsed = subprocess.run([str(squid), "-n", service_name, "-k", "parse", "-f", str(config)],
+                            capture_output=True, text=True, timeout=10, check=False)
+    assert parsed.returncode == 0, parsed.stderr[-1000:]
+
+    stderr_path = root / "squid.stderr"
+    stderr_log = stderr_path.open("wb")
+    process = subprocess.Popen([str(squid), "-n", service_name, "--foreground", "-N", "-f", str(config)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=stderr_log, close_fds=True)
+
+    def startup_failure(phase: str) -> str:
+        stderr_log.flush()
+        stderr_detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+        cache_log_path = root / "squid.cache.log"
+        cache_detail = (cache_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        if cache_log_path.exists() else "")
+        detail = "\n".join(part for part in (stderr_detail, cache_detail) if part)
+        suffix = f"\nSquid logs:\n{detail}" if detail else " (no log output)"
+        return f"Squid exited during {phase} with status {process.returncode}{suffix}"
+
+    def status_code() -> int:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2) as client:
+            client.settimeout(4)
+            client.sendall(b"GET http://target.example/ HTTP/1.1\r\n"
+                           b"Host: target.example\r\nConnection: close\r\n\r\n")
+            first_line = client.recv(1024).split(b"\r\n", 1)[0]
+        return int(first_line.split()[1])
+
+    def rebind(answer: str) -> None:
+        hosts.write_text(answer, encoding="ascii")
+        result = subprocess.run([str(squid), "-n", service_name, "-k", "reconfigure", "-f", str(config)],
+                                capture_output=True, text=True, timeout=5, check=False)
+        assert result.returncode == 0, result.stderr[-1000:]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                pytest.fail(startup_failure("reconfigure"))
+            try:
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        pytest.fail("Squid did not reopen the test listener after reconfigure")
+
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                pytest.fail(startup_failure("startup"))
+            try:
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            pytest.fail("Squid did not start the test listener")
+
+        # A public address passes the ACL; the network may still reject the
+        # actual connection, so a Squid 503 is an allowed-policy result.
+        code = status_code()
+        cache_log = (root / "squid.cache.log").read_text(encoding="utf-8", errors="replace")
+        assert code != 403, f"public destination denied with HTTP {code}; Squid cache log:\n{cache_log[-6000:]}"
+        for answer in (
+            "127.0.0.1 target.example\n",
+            "10.2.3.4 target.example\n",
+            "169.254.169.254 target.example\n",
+            "8.8.8.8 target.example\n127.0.0.1 target.example\n",
+        ):
+            rebind(answer)
+            assert status_code() == 403
+
+        # The same running proxy must deny a request after its answer changes
+        # from a public IP to loopback.
+        rebind("8.8.8.8 target.example\n")
+        assert status_code() != 403
+        rebind("127.0.0.1 target.example\n")
+        assert status_code() == 403
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        stderr_log.close()
+
+
+def test_explicit_ip_and_cidr_proxy_rules_keep_their_explicit_destination_semantics():
+    helper = _helper_module()
+    config = helper.squid_config("u1000-locked-vm", "10.0.0.200", "10.0.0.1", 20200,
+                                 [{"kind": "ip", "value": "127.0.0.1", "port": 8080},
+                                  {"kind": "cidr", "value": "10.20.0.0/16", "port": 5432}])
+    assert "acl non_global_destination" not in config
+    assert "destination_has_ipv4_address" not in config
+    assert "tcp_outgoing_mark" not in config
+    assert "http_access allow vm_source destination_0 destination_port_0\n" in config
+    assert "http_access allow vm_source destination_1 destination_port_1\n" in config
+
+
+def test_domain_policy_adds_actual_destination_firewall_without_changing_explicit_ip_rules():
+    helper = _helper_module()
+    domain_config = helper.squid_config("u1000-vm", "10.0.0.200", "10.0.0.1", 20200,
+                                        [{"kind": "domain", "value": "example.com", "port": 443}])
+    assert f"tcp_outgoing_mark {helper.DOMAIN_EGRESS_MARK} vm_source destination_0" in domain_config
+    domain_table = helper.render_nft({"u1000-vm": {
+        "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+        "mac": "02:00:00:00:00:01",
+        "rules": [{"kind": "domain", "value": "example.com", "port": 443}],
+    }})
+    assert "table inet isolatevm_domain_egress" in domain_table
+    assert f"meta mark {helper.DOMAIN_EGRESS_MARK} ip daddr 127.0.0.0/8 drop" in domain_table
+    assert f"meta mark {helper.DOMAIN_EGRESS_MARK} ip daddr 100.64.0.0/10 drop" in domain_table
+    assert f"meta mark {helper.DOMAIN_EGRESS_MARK} ip6 daddr ::/0 drop" in domain_table
+
+    explicit_table = helper.render_nft({"u1000-vm": {
+        "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+        "mac": "02:00:00:00:00:01",
+        "rules": [{"kind": "ip", "value": "127.0.0.1", "port": 8080}],
+    }})
+    assert "table inet isolatevm_domain_egress" not in explicit_table
+
+
+def test_domain_firewall_tables_are_replaced_in_one_nft_transaction(monkeypatch):
+    from types import SimpleNamespace
+
+    helper = _helper_module()
+    calls = []
+
+    def run(*args, input_text=None, check=True):
+        calls.append((args, input_text, check))
+        return SimpleNamespace(returncode=0, stdout="table exists", stderr="")
+
+    monkeypatch.setattr(helper, "run", run)
+    helper.apply_nft({"u1000-vm": {
+        "mac": "02:00:00:00:00:01", "address": "10.0.0.200", "gateway": "10.0.0.1",
+        "port": 20200, "rules": [{"kind": "domain", "value": "example.com", "port": 443}],
+    }})
+    assert [call[0][1:5] for call in calls[:2]] == [
+        ("list", "table", "bridge", "isolatevm_egress"),
+        ("list", "table", "inet", "isolatevm_domain_egress"),
+    ]
+    payload = calls[2][1]
+    assert payload.startswith("delete table bridge isolatevm_egress\ndelete table inet isolatevm_domain_egress\n")
+    assert "table bridge isolatevm_egress" in payload
+    assert "table inet isolatevm_domain_egress" in payload
+    assert calls[2][0] == ("/usr/sbin/nft", "--check", "--file", "-")
+    assert calls[3][0] == ("/usr/sbin/nft", "--file", "-")
+    assert calls[3][1] == payload
+
+
+def test_removing_last_domain_policy_deletes_both_firewall_tables_in_one_transaction(monkeypatch):
+    from types import SimpleNamespace
+
+    helper = _helper_module()
+    calls = []
+
+    def run(*args, input_text=None, check=True):
+        calls.append((args, input_text, check))
+        return SimpleNamespace(returncode=0, stdout="table exists", stderr="")
+
+    monkeypatch.setattr(helper, "run", run)
+    helper.apply_nft({})
+    assert calls[2][1] == "delete table bridge isolatevm_egress\ndelete table inet isolatevm_domain_egress\n"
+    assert calls[2][0] == ("/usr/sbin/nft", "--check", "--file", "-")
+    assert calls[3][0] == ("/usr/sbin/nft", "--file", "-")
+    assert calls[3][1] == calls[2][1]
+
+
+@pytest.mark.parametrize("failed_stage", [
+    "ensure_bridge_netfilter", "ensure_firewall_guard",
+    "unit:stop", "unit:disable", "prepare_logs", "write_config", "save_state",
+    "apply_nft", "unit:enable", "unit:restart",
+])
+def test_failed_policy_apply_leaves_proxy_stopped_and_disabled_for_retry(monkeypatch, failed_stage):
+    helper = _helper_module()
+    existing = {"bridge": "incusbr-1000", "network_mode": "restricted",
+                "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+                "mac": "02:00:00:00:00:01", "rules": [{"kind": "domain", "value": "github.com", "port": 443}],
+                "owner_uid": 1000, "name": "locked-vm", "service_name": "u1000-locked-vm"}
+    monkeypatch.setattr(helper, "bridge_info", lambda *_args: ("10.0.0.1", helper.ipaddress.ip_network("10.0.0.0/24")))
+    monkeypatch.setattr(helper, "state", lambda: {"u1000-locked-vm": existing.copy()})
+    monkeypatch.setattr(helper, "lease_addresses", lambda _bridge, _uid: set())
+    monkeypatch.setattr(helper, "ensure_bridge_netfilter", lambda: None)
+    monkeypatch.setattr(helper, "ensure_firewall_guard", lambda: None)
+    events = []
+
+    def stage(name):
+        def run(*_args, **_kwargs):
+            events.append(name)
+            if name == failed_stage:
+                raise helper.Error("injected failure")
+        return run
+
+    for name in ("ensure_bridge_netfilter", "ensure_firewall_guard", "prepare_logs",
+                 "write_config", "save_state", "apply_nft"):
+        monkeypatch.setattr(helper, name, stage(name))
+
+    def unit(_service, action):
+        name = f"unit:{action}"
+        events.append(name)
+        if name == failed_stage:
+            raise helper.Error("injected failure")
+
+    monkeypatch.setattr(helper, "unit", unit)
+    with pytest.raises(helper.Error):
+        helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
+                      "network_mode": "restricted",
+                      "rules": [{"kind": "domain", "value": "api.github.com", "port": 443}]}, 1000)
+    assert events[-2:] == ["unit:stop", "unit:disable"]
+
+
+def test_successful_policy_apply_disables_old_listener_until_firewall_is_replaced(monkeypatch):
+    helper = _helper_module()
+    existing = {"bridge": "incusbr-1000", "network_mode": "restricted",
+                "address": "10.0.0.200", "gateway": "10.0.0.1", "port": 20200,
+                "mac": "02:00:00:00:00:01", "rules": [{"kind": "domain", "value": "github.com", "port": 443}],
+                "owner_uid": 1000, "name": "locked-vm", "service_name": "u1000-locked-vm"}
+    monkeypatch.setattr(helper, "bridge_info", lambda *_args: ("10.0.0.1", helper.ipaddress.ip_network("10.0.0.0/24")))
+    monkeypatch.setattr(helper, "state", lambda: {"u1000-locked-vm": existing.copy()})
+    monkeypatch.setattr(helper, "lease_addresses", lambda _bridge, _uid: set())
+    monkeypatch.setattr(helper, "ensure_bridge_netfilter", lambda: None)
+    monkeypatch.setattr(helper, "ensure_firewall_guard", lambda: None)
+    events = []
+    monkeypatch.setattr(helper, "unit", lambda _service, action: events.append(f"unit:{action}"))
+    monkeypatch.setattr(helper, "prepare_logs", lambda _service: events.append("logs"))
+    monkeypatch.setattr(helper, "write_config", lambda *_args: events.append("config"))
+    monkeypatch.setattr(helper, "save_state", lambda _data: events.append("state"))
+    monkeypatch.setattr(helper, "apply_nft", lambda _data: events.append("firewall"))
+    helper.apply({"version": 1, "name": "locked-vm", "bridge": "incusbr-1000",
+                  "network_mode": "restricted",
+                  "rules": [{"kind": "domain", "value": "api.github.com", "port": 443}]}, 1000)
+    assert events.index("unit:stop") < events.index("unit:disable") < events.index("logs")
+    assert events.index("config") < events.index("state") < events.index("firewall")
+    assert events.index("firewall") < events.index("unit:enable") < events.index("unit:restart")

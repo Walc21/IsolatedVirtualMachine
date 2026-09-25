@@ -14,6 +14,8 @@ from .model import Manifest, ValidationError, _name
 
 
 MAX_MANIFEST_BYTES = 64_000
+MAX_AUDIT_BYTES = 16 * 1024 * 1024
+MAX_SETTINGS_BYTES = 64_000
 
 
 def _read_manifest(path: Path) -> str:
@@ -51,17 +53,56 @@ def audit(action: str, vm: str, result: str, source: str = "gui") -> None:
     if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "pci-add", "pci-remove", "disk-volume-add", "disk-volume-delete", "network-block", "network-restore", "resources", "disk-grow", "cpu-pin", "clone", "template", "export", "backup-full", "backup-workspace", "backup-data-volume", "secret-store", "secret-delete", "secret-inject", "secret-clear", "copy-files", "disposable-retain"}:
         raise ValidationError("Ação de auditoria desconhecida")
     event = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             "action": action, "vm": vm, "result": result, "source": source}
+             "action": action, "vm": vm, "result": str(result)[:2048], "source": source}
     path = data_dir() / "audit.jsonl"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags, 0o600)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+            info.st_nlink != 1 or info.st_size > MAX_AUDIT_BYTES):
+        os.close(fd)
+        raise ValidationError("Arquivo de auditoria inválido ou acima do limite")
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as stream:
         stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def history(limit: int = 200) -> list[dict]:
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValidationError("Limite do histórico inválido")
     path = data_dir() / "audit.jsonl"
-    if not path.exists(): return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()[-limit:] if line.strip()][::-1]
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                info.st_nlink != 1 or info.st_size > MAX_AUDIT_BYTES):
+            raise ValidationError("Arquivo de auditoria inválido ou acima do limite")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_AUDIT_BYTES + 1)
+        if len(raw) > MAX_AUDIT_BYTES:
+            raise ValidationError("Arquivo de auditoria acima do limite")
+        lines = raw.decode("utf-8").splitlines()[-limit:]
+        entries = []
+        field_limits = {"time": 64, "action": 64, "vm": 128,
+                        "result": 2048, "source": 64}
+        for line in lines:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if (not isinstance(entry, dict) or set(entry) != set(field_limits) or
+                    any(not isinstance(value, str) or len(value) > field_limits[key]
+                        for key, value in entry.items())):
+                raise ValidationError("Registro do histórico de auditoria inválido")
+            entries.append(entry)
+        return entries[::-1]
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValidationError("Arquivo de auditoria inválido ou indisponível") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def save_template(name: str, manifest: Manifest) -> Path:
@@ -115,9 +156,22 @@ def save_instance_manifest(manifest: Manifest) -> Path:
     folder = data_dir() / "instances"
     folder.mkdir(mode=0o700, exist_ok=True)
     path = folder / f"{manifest.name}.yaml"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(manifest.to_yaml())
+    fd, temporary = tempfile.mkstemp(prefix=f".{manifest.name}.", suffix=".yaml", dir=folder)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(manifest.to_yaml())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return path
 
 
@@ -189,12 +243,24 @@ def load_theme() -> str:
 
 def _read_settings() -> dict:
     path = data_dir() / "settings.json"
-    if not path.is_file() or path.is_symlink(): return {}
+    fd = -1
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                info.st_nlink != 1 or info.st_size > MAX_SETTINGS_BYTES):
+            return {}
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_SETTINGS_BYTES + 1)
+        if len(raw) > MAX_SETTINGS_BYTES:
+            return {}
+        value = json.loads(raw.decode("utf-8"))
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _write_settings(value: dict) -> None:

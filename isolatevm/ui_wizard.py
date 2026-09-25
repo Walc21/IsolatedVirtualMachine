@@ -126,9 +126,10 @@ class WizardMixin:
             self.catalog_sections.append(section)
         self.ai_coding_checks: dict[str, Gtk.CheckButton] = {}
         for item in AI_CODING_ITEMS:
-            method = "npm · latest" if item.manager == "npm" else "PyPI / pipx · 0.86.2"
+            method = (f"npm · {item.package.rsplit('@', 1)[-1]}" if item.manager == "npm"
+                      else "PyPI / pipx · 0.86.2")
             check = Gtk.CheckButton(label=f"{item.label} · {method}")
-            if item.package == "opencode-ai@latest":
+            if item.package == "opencode-ai@1.18.31":
                 check.set_tooltip_text("O pacote npm baixa o binário nativo da plataforma durante a instalação.")
             elif item.package == "aider-chat==0.86.2":
                 check.set_tooltip_text("Versão fixada; requer Python 3.10–3.12 (Ubuntu 22.04 ou 24.04).")
@@ -236,7 +237,7 @@ class WizardMixin:
             for check in self.ai_coding_checks.values():
                 self.step_body.append(check)
             self.step_body.append(self.aider_status)
-            self.step_body.append(label("OpenAI Codex, Claude Code e OpenCode são instalados pela versão npm atual; Aider usa o release 0.86.2 via pipx. Faça login dentro da VM ou referencie um secret guardado nesta sessão. O host nunca fornece credenciais ou arquivos de autenticação automaticamente.", "muted"))
+            self.step_body.append(label("Codex, Claude Code e OpenCode usam versões npm fixadas no catálogo; Aider usa o release 0.86.2 via pipx. Faça login dentro da VM ou referencie um secret guardado nesta sessão. O host nunca fornece credenciais ou arquivos de autenticação automaticamente.", "muted"))
         elif self.wizard_step == 8:
             self.step_body.append(label("Somente valores não secretos. Uma linha NOME=VALOR por variável.", "risk"))
             self.step_body.append(self.environment_view)

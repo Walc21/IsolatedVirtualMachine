@@ -31,3 +31,17 @@ def test_guest_container_engine_has_explicit_warning():
         "resources": {"cpu": 2, "memoryMiB": 4096, "diskGiB": 30, "pool": "default"},
         "network": {"mode": "offline"}, "mounts": [], "software": {"apt": ["docker.io"]}})
     assert {finding.code for finding in assess(manifest)} == {"OFFLINE_PROVISION", "GUEST_CONTAINER_ENGINE"}
+
+
+def test_rolling_npm_tag_is_warned_and_curated_ai_packages_are_pinned():
+    from isolatevm.software_catalog import AI_CODING_ITEMS
+
+    packages = [item.package for item in AI_CODING_ITEMS if item.manager == "npm"]
+    assert packages == ["@openai/codex@0.154.0", "@anthropic-ai/claude-code@2.1.276",
+                        "opencode-ai@1.18.31"]
+    manifest = Manifest.parse({"schemaVersion": 1, "name": "rolling-npm",
+        "os": {"distribution": "ubuntu", "release": "24.04"},
+        "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+        "network": {"mode": "offline"}, "mounts": [],
+        "software": {"apt": [], "npm": ["some-tool@latest"]}})
+    assert "ROLLING_NPM" in {finding.code for finding in assess(manifest)}

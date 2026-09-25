@@ -38,10 +38,10 @@ CATALOG_GROUPS: tuple[tuple[str, tuple[CatalogItem, ...]], ...] = (
 # Optional AI coding CLIs are kept separate from the general package catalog so
 # the wizard can present them in its dedicated development-tools step.
 AI_CODING_ITEMS: tuple[CatalogItem, ...] = (
-    CatalogItem("OpenAI Codex CLI", "@openai/codex@latest", "npm"),
-    CatalogItem("Claude Code", "@anthropic-ai/claude-code@latest", "npm"),
+    CatalogItem("OpenAI Codex CLI", "@openai/codex@0.154.0", "npm"),
+    CatalogItem("Claude Code", "@anthropic-ai/claude-code@2.1.276", "npm"),
     CatalogItem("Aider", "aider-chat==0.86.2", "pipx"),
-    CatalogItem("OpenCode", "opencode-ai@latest", "npm"),
+    CatalogItem("OpenCode", "opencode-ai@1.18.31", "npm"),
 )
 AI_CODING_PACKAGES = {
     manager: frozenset(item.package for item in AI_CODING_ITEMS if item.manager == manager)

@@ -2,7 +2,7 @@
 
 ## Estado da implementação
 
-O código atual está na versão **0.3.8**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, discos de dados Incus com propriedade validada e cópia independente ao clonar, comparação de alterações antes de aplicá-las, aumento revisável do disco raiz para VMs paradas, exportação versionada de manifestos e templates, consulta das versões instaladas dos pacotes selecionados, ferramentas de coding com IA opcionais no guest e terminal VTE integrado.
+O código atual está na versão **0.3.9**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, discos de dados Incus com propriedade validada e cópia independente ao clonar, comparação de alterações antes de aplicá-las, aumento revisável do disco raiz para VMs paradas, exportação versionada de manifestos e templates, consulta das versões instaladas dos pacotes selecionados, ferramentas de coding com IA opcionais no guest e terminal VTE integrado.
 
 O terminal integrado usa VTE GTK4 para abrir `incus exec` em um PTY, sem expor os comandos digitados ao shell do host. A sessão entra como root dentro do guest. O terminal externo permanece disponível como alternativa.
 
@@ -39,13 +39,15 @@ Ao alterar CPU/RAM, mounts, rede, dispositivos ou aumentar o disco de uma VM exi
 - Descobre USB, GPUs e outras funções PCI em modo somente leitura. USB, GPU e PCI exigem ação explícita; USB usa serial único ou endereço atual do dispositivo. GPU e PCI bruto exigem VM parada e autorização do projeto Incus. O seletor PCI exclui funções de rede, GPU e bridge, incluindo funções irmãs da mesma placa. O passthrough PCI pode interromper o host e requer revisão de IOMMU e grupos; nenhum dispositivo físico foi anexado nesta validação.
 - Incus oferece dispositivos `unix-char` e `unix-hotplug` para containers, não VMs. Adaptadores seriais USB podem ser entregues como USB; uma porta serial virtual da VM não é configurada pelo IsolateVM.
 - O disco raiz pode ser aumentado com a VM parada e uma prévia revisável. Redução não é oferecida e o crescimento não redimensiona o sistema de arquivos dentro do guest.
-- Para VMs, o editor ajusta a quantidade de vCPUs. Prioridade e limite de CPU por allowance são opções de containers no Incus; pinning físico de CPUs não é oferecido por esse editor.
+- Para VMs, o editor ajusta a quantidade de vCPUs e oferece pinning opcional por IDs de CPUs lógicas/threads anunciados pelo Incus. A seleção deve ter a mesma quantidade de IDs e vCPUs, é revalidada contra CPUs online imediatamente antes da mudança e exige VM parada; não reserva CPUs exclusivamente. Prioridade e limite por allowance são opções de containers no Incus.
 
 ## Rede e perfis de isolamento
 
 O manifesto padrão pede **rede offline**, nenhum mount do host e nenhum dispositivo repassado. O perfil `maximum-isolation` exige rede offline e zero mounts. A política `restricted-development` usa um proxy dedicado por VM e regras de firewall geradas para aceitar somente combinações declaradas de domínio/IP/CIDR canônicos e portas TCP. O modo `lan-only` reusa esse caminho, mas aceita somente CIDRs IPv4 privados explícitos, com portas TCP. O helper revalida o modo e as regras separadamente via Polkit, enquanto o processo GTK continua sem privilégios. Para restaurar o filtro antes do daemon Incus no boot, o helper instala um serviço systemd e um drop-in protegido; se a restauração falhar, o daemon não inicia. A remoção da última política limpa essa dependência, e a desinstalação do pacote é bloqueada enquanto existirem políticas restritas.
 
 O modo de rede `normal` é uma rede comum para a VM e não filtra domínios. Uma bridge customizada pode ser selecionada se já existir como bridge gerenciada do Incus; o IsolateVM não configura redes globais nem promete que uma LAN particular seja alcançável pelo host. No modo `lan-only`, somente os CIDRs RFC1918 escolhidos e suas portas TCP são encaminhados pelo proxy; DNS e conexões diretas do guest permanecem bloqueados. A política de proxy restrito controla a saída de rede do guest; não audita os dados ou programas dentro dele, outros caminhos até o host nem políticas externas ao Incus. Inspecione a configuração efetiva antes de confiar em qualquer perfil. O Incus é a fonte de verdade do estado das VMs, portanto manifestos locais podem divergir depois de alterações externas.
+
+Em `restricted`, regras `domain` verificam domínio, porta e endereço resolvido pelo Squid; respostas IPv4 especiais/não globais são negadas e qualquer resposta IPv6 faz a regra falhar. Assim, domínios permitidos não liberam implicitamente loopback, link-local, RFC1918, CGNAT ou multicast. Isso não se aplica a `ip`/`cidr`: esses tipos mantêm autorização explícita para os endereços declarados, inclusive privados. A validação desta revisão executou Squid real com respostas públicas, privadas, mistas e alteradas para loopback, mas não fez uma nova VM Incus por indisponibilidade do daemon neste host.
 
 Variáveis comuns de ambiente ficam visíveis ao guest e podem ser armazenadas na configuração Incus; use-as somente para dados públicos. Secrets são guardados no Secret Service da sessão do usuário, e o manifesto registra apenas seus nomes. Depois da criação, uma ação explícita envia os valores pela entrada padrão do agente Incus para arquivos no tmpfs `/run` do guest; eles não são incorporados ao manifesto, cloud-init ou configuração Incus. Use `isolatevm-run --secret NOME -- comando` no guest para iniciar um processo com a variável definida. Processos executados como o usuário `ubuntu` podem ler os secrets entregues; limpeza ou desligamento remove os arquivos, mas não apaga cópias já carregadas em processos. O perfil `maximum-isolation` bloqueia secrets. Pastas do host nunca são montadas automaticamente. Selecione somente caminhos que pretende expor e prefira mounts somente para leitura quando possível.
 
@@ -101,7 +103,7 @@ O workflow do GitHub Actions usa um runner Ubuntu 24.04, compila os módulos Pyt
 
 ```bash
 ./scripts/build-deb.sh
-dpkg-deb --contents dist/isolatevm_0.3.8_all.deb
+dpkg-deb --contents dist/isolatevm_0.3.9_all.deb
 ```
 
 O pacote é gerado localmente em `dist/`; arquivos `.deb` gerados ficam fora do Git. O launcher roda como usuário da sessão. Configurar Incus e as permissões necessárias continua sendo responsabilidade do operador. Consulte [PACKAGING.md](PACKAGING.md) para o conteúdo do pacote e operações opcionais no host.

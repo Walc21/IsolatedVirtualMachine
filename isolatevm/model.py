@@ -163,6 +163,63 @@ class CopySpec:
                 "includeHidden": self.include_hidden}
 
 
+def _overlaps(left: str, right: str) -> bool:
+    a, b = Path(left), Path(right)
+    return a == b or a in b.parents or b in a.parents
+
+
+def validate_mount_set(mounts: tuple[Mount, ...] | list[Mount],
+                       copies: tuple[CopySpec, ...] | list[CopySpec] = (), *,
+                       profile: str | None = None,
+                       existing_mounts: tuple[tuple[str, str], ...] | list[tuple[str, str]] = (),
+                       guest_volume_targets: tuple[str, ...] | list[str] = ()) -> None:
+    """Apply the canonical set-level mount/copy/volume path invariants.
+
+    Mount.parse() remains responsible for validating each new host source,
+    guest path, mode, symlink and HOME boundary. This function is shared by
+    manifests and incremental backend operations so pairwise overlap policy
+    cannot drift between the two entry points.
+    """
+    if len(mounts) + len(existing_mounts) > 16:
+        raise ValidationError("Máximo de 16 mounts")
+    if profile == "maximum-isolation" and mounts:
+        raise ValidationError("Máximo isolamento impede compartilhar pastas do host")
+
+    all_mounts: list[tuple[str, str]] = list(existing_mounts)
+    for source, target in all_mounts:
+        if (not isinstance(source, str) or not source.startswith("/") or
+                not isinstance(target, str) or not GUEST.fullmatch(target) or
+                ".." in Path(target).parts or target == "/"):
+            raise ValidationError("Mount efetivo inválido; adição recusada")
+    all_mounts.extend((mount.host, mount.guest) for mount in mounts)
+    for index, (source, target) in enumerate(all_mounts):
+        for earlier_source, earlier_target in all_mounts[:index]:
+            if _overlaps(target, earlier_target):
+                raise ValidationError("Destinos de mount duplicados ou sobrepostos")
+            if _overlaps(source, earlier_source):
+                raise ValidationError("Pastas do host duplicadas ou sobrepostas")
+
+    copy_targets = [copy.guest for copy in copies]
+    for index, target in enumerate(copy_targets):
+        for _source, mount_target in all_mounts:
+            if _overlaps(target, mount_target):
+                raise ValidationError("Cópia: destino se sobrepõe a um compartilhamento permanente")
+        if any(_overlaps(target, earlier) for earlier in copy_targets[:index]):
+            raise ValidationError("Cópia: destinos duplicados ou sobrepostos")
+
+    for index, target in enumerate(guest_volume_targets):
+        if (not isinstance(target, str) or not GUEST.fullmatch(target) or
+                ".." in Path(target).parts or target == "/"):
+            raise ValidationError("Destino de volume Incus inválido; adição recusada")
+        overlaps_mount = any(_overlaps(target, mount_target) for _source, mount_target in all_mounts)
+        if target == "/workspace" and overlaps_mount:
+            raise ValidationError("Persistir /workspace exige um volume Incus próprio; mounts host se sobrepõem")
+        if overlaps_mount or any(_overlaps(target, copy_target) for copy_target in copy_targets):
+            raise ValidationError("Destino se sobrepõe a um volume Incus separado")
+        if any(_overlaps(target, earlier) for earlier in guest_volume_targets[:index]):
+            raise ValidationError("Destinos de volumes Incus duplicados ou sobrepostos")
+
+
 @dataclass(frozen=True)
 class EgressRule:
     """One explicit TCP destination admitted by the restricted proxy."""
@@ -267,14 +324,6 @@ class Manifest:
         if not isinstance(mounts_raw, list) or len(mounts_raw) > 16:
             raise ValidationError("Máximo de 16 mounts")
         mounts = tuple(Mount.parse(x) for x in mounts_raw)
-        for index, mount in enumerate(mounts):
-            for earlier in mounts[:index]:
-                guest = Path(mount.guest); prior_guest = Path(earlier.guest)
-                host = Path(mount.host); prior_host = Path(earlier.host)
-                if guest == prior_guest or guest in prior_guest.parents or prior_guest in guest.parents:
-                    raise ValidationError("Destinos de mount duplicados ou sobrepostos")
-                if host == prior_host or host in prior_host.parents or prior_host in host.parents:
-                    raise ValidationError("Pastas do host duplicadas ou sobrepostas")
         copies_raw = item.get("copies", [])
         if not isinstance(copies_raw, list) or len(copies_raw) > 16:
             raise ValidationError("Cópia: máximo de 16 origens")
@@ -282,13 +331,6 @@ class Manifest:
         total_files = 0
         total_bytes = 0
         for index, copy in enumerate(copies):
-            destination = Path(copy.guest)
-            if any(destination == Path(mount.guest) or destination in Path(mount.guest).parents or
-                   Path(mount.guest) in destination.parents for mount in mounts):
-                raise ValidationError("Cópia: destino se sobrepõe a um compartilhamento permanente")
-            if any(destination == Path(earlier.guest) or destination in Path(earlier.guest).parents or
-                   Path(earlier.guest) in destination.parents for earlier in copies[:index]):
-                raise ValidationError("Cópia: destinos duplicados ou sobrepostos")
             if check_copy_sources:
                 try:
                     entries = scan_source(copy.host, copy.kind, copy.include_hidden)
@@ -306,7 +348,7 @@ class Manifest:
             raise ValidationError("Desenvolvimento restrito exige proxy de saída restricted ou LAN-only")
         if mode in PROXIED_NETWORK_MODES and profile != "restricted-development":
             raise ValidationError("Rede proxied exige o perfil restricted-development")
-        if profile == "maximum-isolation" and (mode != "offline" or mounts):
+        if profile == "maximum-isolation" and mode != "offline":
             raise ValidationError("Máximo isolamento exige rede offline e nenhum compartilhamento do host")
         if profile == "maximum-isolation" and copies:
             raise ValidationError("Máximo isolamento impede copiar arquivos do host para a VM")
@@ -326,12 +368,10 @@ class Manifest:
         if disposition == "persist-workspace":
             workspace_size = _integer(lifecycle.get("workspaceSizeGiB", 20), 1, 2048,
                                       "Tamanho persistente de /workspace")
-            workspace_path = Path("/workspace")
-            if any(Path(mount.guest) == workspace_path or Path(mount.guest) in workspace_path.parents or
-                   workspace_path in Path(mount.guest).parents for mount in mounts):
-                raise ValidationError("Persistir /workspace exige um volume Incus próprio; remova mounts host sobrepostos")
         elif "workspaceSizeGiB" in lifecycle:
             raise ValidationError("workspaceSizeGiB só pode ser definido com persist-workspace")
+        validate_mount_set(mounts, copies, profile=profile,
+                           guest_volume_targets=("/workspace",) if disposition == "persist-workspace" else ())
         environment = item.get("environment", {})
         if not isinstance(environment, dict) or len(environment) > 32:
             raise ValidationError("Variáveis de ambiente: máximo de 32 pares NOME=VALOR")

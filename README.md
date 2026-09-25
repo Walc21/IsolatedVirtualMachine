@@ -2,7 +2,7 @@
 
 ## Estado da implementação
 
-O código atual está na versão **0.3.9**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, discos de dados Incus com propriedade validada e cópia independente ao clonar, comparação de alterações antes de aplicá-las, aumento revisável do disco raiz para VMs paradas, exportação versionada de manifestos e templates, consulta das versões instaladas dos pacotes selecionados, ferramentas de coding com IA opcionais no guest e terminal VTE integrado.
+O código atual está na versão **0.3.10**. O aplicativo GTK administra VMs Ubuntu cloud por meio do Incus local, com manifestos revisáveis e autorização explícita para rede, mounts, cópias, secrets e dispositivos. Também inclui snapshots de proteção, ciclos de vida configuráveis, persistência separada de `/workspace`, discos de dados Incus com propriedade validada e cópia independente ao clonar, comparação de alterações antes de aplicá-las, aumento revisável do disco raiz para VMs paradas, exportação versionada de manifestos e templates, consulta das versões instaladas dos pacotes selecionados, ferramentas de coding com IA opcionais no guest e terminal VTE integrado.
 
 O terminal integrado usa VTE GTK4 para abrir `incus exec` em um PTY, sem expor os comandos digitados ao shell do host. A sessão entra como root dentro do guest. O terminal externo permanece disponível como alternativa.
 
@@ -103,7 +103,7 @@ O workflow do GitHub Actions usa um runner Ubuntu 24.04, compila os módulos Pyt
 
 ```bash
 ./scripts/build-deb.sh
-dpkg-deb --contents dist/isolatevm_0.3.9_all.deb
+dpkg-deb --contents dist/isolatevm_0.3.10_all.deb
 ```
 
 O pacote é gerado localmente em `dist/`; arquivos `.deb` gerados ficam fora do Git. O launcher roda como usuário da sessão. Configurar Incus e as permissões necessárias continua sendo responsabilidade do operador. Consulte [PACKAGING.md](PACKAGING.md) para o conteúdo do pacote e operações opcionais no host.

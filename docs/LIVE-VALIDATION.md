@@ -2,7 +2,52 @@
 
 This file records capabilities exercised against a locally configured Incus daemon. These observations are evidence from one test environment, not a guarantee for every Incus version, host policy, image, network, or storage backend. The automated test suite uses mocks and does not replace these live checks.
 
-## Revisão 0.3.9 — estado verificado em 2026-09-24
+## Release candidate 0.3.10 — validação de 2026-09-25
+
+Esta seção é o registro autoritativo da validação atual, na branch `codex/isolatevm-release-validation`, iniciada em `8c78fbb5119888ea0d6944ac91d99f81896cf6d5`. As notas posteriores preservam o histórico de revisões anteriores e não descrevem necessariamente o host ou o estado atual.
+
+### AUTOMATED TESTED
+
+- `python3 -m pytest -q`: **320 passed, 7 skipped, 1 warning**.
+- `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`: **327 passed, 1 warning**; warning de depreciação do PyGObject em `GLib.unix_signal_add_full`.
+- `python3 -m compileall -q isolatevm packaging/isolatevm-egress-helper.py packaging/guest` e `git diff --check`: passaram.
+- Testes cobrem helper de egress, resposta mista/rebinding e destinos especiais, IP/CIDR explícitos, falhas parciais, confirmação da ausência da VM antes de remover a política, seleção obsoleta de hardware, cópias, variáveis de subprocesso e limites de saída do guest. A suíte não substitui a execução física descrita abaixo.
+
+### LIVE TESTED
+
+- Host Ubuntu 26.04.1 x86_64, Incus 6.0.5 e QEMU 10.2.1. O usuário `victor` usou o socket confinado e o projeto restrito `user-1000`, sem `incus-admin`; `LocalIncus` reconheceu o fallback de pool `isolatevm` e a bridge `incusbr-1000`. IDs de CPU online anunciados: 0–7. Pinning válido em 0–1 foi aplicado em VM parada; seleção offline/stale foi recusada e não alterou a configuração.
+- VMs Ubuntu 24.04 foram criadas pelo backend `LocalIncus` com imagem cloud verificada no cache local. A VM offline tinha `profiles: []`, somente o dispositivo `root`, sem NIC, mounts, secrets ou passthrough; start, restart, agent, `uname`, stop gracioso e exclusão passaram.
+- Copy-once transferiu arquivo sintético com SHA-256 conhecido, arquivo vazio, diretório contendo pasta vazia e nome de 214 bytes. O receipt repetido foi idêntico; editar a origem depois não alterou o guest; não houve mount.
+- Secrets: a execução anterior desta missão completou o ciclo Secret Service → stdin de `incus exec` → helper guest → `/run` tmpfs → runner como `ubuntu`; o valor nunca foi impresso, o hash coincidiu, `clear` invalidou a referência e reboot do guest limpou o tmpfs. Credencial foi sintética.
+- Lifecycle: `/workspace` separado sobreviveu ao restore do snapshot inicial, o root disk e CPU voltaram ao estado inicial, e clone recebeu volume independente; delete-on-close e `persistent` foram exercitados. Snapshot nomeado passou por create/rename/restore/delete após `sync`; `isolatevm-initial` recusou rename/delete. Clone comum manteve disco independente.
+- Data volumes: montagem guest `virtiofs` RW permitiu gravação por UID 1000; RO apresentou opção `ro` e bloqueou escrita até de root. Clone preservou conteúdo inicial e isolou gravações; export `.tar.gz` novo saiu em modo `0600`; exclusões validaram os marcadores e removeram somente os volumes de teste. A montagem guest apresentou capacidade do backend compartilhado no `df`; a quota efetiva de 1 GiB não foi comprovada neste driver.
+- Mounts incrementais, apenas de diretórios temporários sob `$HOME`: RO/RW efetivos foram confirmados no guest, escrita em RO bloqueada, escrita RW do UID 1000 apareceu no host, sobreposição guest foi recusada e ambos os mounts foram removidos.
+- Rede `normal`: cloud-init instalou `jq` do repositório Ubuntu; `jq --version` e o inventário APT do guest concordaram em `1.7.1-3ubuntu0.24.04.2`. Isso também confirmou que `normal` usa saída comum, sem promessa de filtro por domínio.
+- Egress `restricted-development`: uma VM real na bridge autorizada passou `example.com:443`, recebeu HTTP 403 para domínio não listado e não conseguiu conexão direta IPv4 nem saída IPv6. Alterar a regra para porta 80 bloqueou CONNECT 443 e permitiu HTTP 80. Injeção de colisão no listener negou a atualização, manteve state/firewall explícitos e deixou a unit parada, sem liberar saída; após liberar a porta, retry aplicou a política e restaurou o tráfego declarado. Restart manual de `isolatevm-egress-firewall.service` preservou as regras. Remoção do pacote durante política ativa foi recusada e não removeu firewall/state; a VM de teste e a política foram depois removidas com ownership confirmado.
+- Blockers encontrados durante os fluxos reais e corrigidos: o helper usava o mesmo lock quando startava a unit que chama `restore-firewall` (deadlock na primeira política); o diretório de logs criado pela versão anterior pertencia a `proxy` e era recusado pela migração; e o inventário CPU usava uma opção `--format` não suportada por `incus info --resources`. Foram adicionados lock de operação separado e readiness check do Squid, migração segura via descritor aberto, cleanup parcial somente após confirmar ausência de VM, e consulta JSON ao endpoint `/1.0/resources`; testes de regressão e os fluxos live correspondentes passaram.
+- Falhas de DNS privado/loopback/link-local, resposta pública+mista, rebinding e comportamento de regras explícitas IP/CIDR passaram o teste de integração Squid com respostas DNS sintéticas, sem depender de um hostname público controlado por terceiros.
+- Backup completo da VM, export do data volume, manifesto e template foram criados em diretório temporário; arquivos novos ficaram com modo `0600`, e destino de manifesto já existente não foi sobrescrito.
+- Terminal PTY real usou argv fixo do cliente Incus, abriu shell como root no guest e executou um marcador de comando dentro da VM; o ambiente do cliente é allowlist. Provisionamento e inventário do pacote `jq` também não receberam variáveis da sessão do host.
+- Inventário somente leitura encontrou 2 GPUs, 6 funções PCI e 7 dispositivos USB. Nenhum dispositivo físico foi anexado.
+
+### INSPECTED
+
+- Unit e drop-in exigem restauração do firewall antes dos serviços Incus; restauração manual foi exercitada. O estado final da política é `{}`, a unit está `inactive/disabled`, não há drop-in nem tabelas nft IsolateVM, e o projeto Incus não contém VMs nem volumes de teste.
+- Catálogo fixa Codex CLI `@openai/codex@0.154.0`, Claude Code `@anthropic-ai/claude-code@2.1.276`, Aider `aider-chat==0.86.2` e OpenCode `opencode-ai@1.18.31`. Testes e inspeção confirmam que npm/pipx são executados como `ubuntu`, npm usa `/home/ubuntu/.local` e o código não importa credenciais do host.
+- `.deb` local `0.3.8` foi usado para downgrade; o pacote `0.3.10` passou upgrade, reinstall, remove, purge e fresh install. Sem conffiles, `dpkg -r` removeu o registro; `dpkg -P` seguinte foi no-op por pacote ausente. A remoção sem política ativa concluiu; durante egress ativo, `prerm` recusou e manteve firewall/state. Depois da fresh install, `dpkg-query` reportou `install ok installed 0.3.10`, import veio de `/usr/lib/python3/dist-packages/isolatevm`, launcher `/usr/bin/isolatevm` permaneceu ativo por 8 s em modo mock sob Xvfb e `dpkg -V` ficou vazio. Launcher/helper privilegiado `0755`; helpers guest, policy, units e documentação `0644`; diretórios `0755`.
+- `onboarding.done` e `settings.json` do usuário mantiveram tamanhos, modos `0600` e SHA-256 de baseline através de remove/purge/fresh install. O pacote não removeu state externo: state egress `{}`, locks `.lock`/`.operation.lock` root-only, config/log vazios; o módulo `br_netfilter` pré-existente foi preservado. Nenhuma VM/volume/política permaneceu.
+- Fluxos de CI local concluíram (`compileall`, pytest e GTK/Xvfb); a GitHub Action remota NÃO foi iniciada, pois esta branch permaneceu local, sem push/PR. O workflow continua pinado em SHA imutável com `contents: read`.
+
+### NOT TESTED / OUT OF SCOPE
+
+- **Reboot físico do host:** não executado. Foi verificada a ordem das units e feita restauração manual; não há afirmação de ausência de janela de saída após um boot real.
+- **LAN-only real:** sem CIDR/host de LAN apropriado e controlado; apenas validação automatizada das regras RFC1918.
+- **CLIs Codex/Claude/Aider/OpenCode em guest:** catálogo/pins, comandos gerados e usuário foram cobertos por testes/inspeção; nenhuma dessas quatro ferramentas foi instalada nem autenticada numa VM real. O boot real de `jq` não valida os feeds npm/PyPI dessas CLIs.
+- **USB/GPU/PCI físico:** somente inventário e lógica de seleção foram testados; nenhum passthrough foi tentado para proteger periféricos e sessão do host.
+- **Desktop gráfico/login interativo**, todos os drivers e versões de Incus, quota de storage em outros backends, e rede externa dual-stack fora dos destinos explicitamente testados.
+- **Autorização interativa do diálogo Polkit:** o caminho privilegiado do helper foi exercitado com autorização administrativa de teste e identidade `PKEXEC_UID` simulada; o diálogo gráfico real não foi clicado nesta execução.
+
+## Histórico — revisão 0.3.9, verificada em 2026-09-24
 
 Os fluxos Incus listados abaixo são registros de revisões anteriores. Nesta revisão, `python3 -m compileall -q isolatevm packaging/isolatevm-egress-helper.py packaging/guest` terminou sem erro. A execução completa de unidade e GTK por `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q` passou com `317 passed, 1 warning` (aviso de depreciação do PyGObject em `GLib.unix_signal_add_full`).
 
@@ -16,7 +61,7 @@ Branch protection remota de `main` foi aplicada e confirmada: pull request obrig
 
 The integrated VTE terminal is covered by the GTK mock flow and argv/environment unit tests. Opening a PTY to a real guest still requires a running VM and an authorized Incus connection; no live terminal session was started during this revision.
 
-## Exercised flows
+### Fluxos anotados em revisões anteriores
 
 - Created and removed disposable Ubuntu cloud VMs through both the backend and GTK wizard using a restricted user project, explicit storage, and explicit network configuration.
 - Exercised VM start/stop, metrics, clone, snapshots, restore, full backup/export, and import. Backup archives include guest data and Incus agent credentials; the application creates a new archive with mode `0600`.
@@ -39,7 +84,7 @@ The integrated VTE terminal is covered by the GTK mock flow and argv/environment
 - Root-disk growth is covered by typed Incus argv tests, an effective-state grow-only diff, stopped-VM checks, mock lifecycle tests, and automatic protection-snapshot policy. No live root disk was resized in this revision.
 - The USB selection path now re-enumerates sysfs before attachment and refuses a changed selection. It passes a unique device serial to Incus, or the current bus/device address when the serial is absent or duplicated. Automated coverage exercises the inventory parsing, identity display data, unique/duplicate serial selection, and stale-selection rejection. No physical USB device was attached, so hardware behavior remains unverified.
 
-## Host integration boundaries
+### Snapshot histórico de integração do host
 
 - The Incus user project remained restricted during the lifecycle checks. Any temporary project capability needed for a check was removed afterward.
 - `victor` is listed in the limited `incus` group, but the current desktop/Codex process has not refreshed supplementary groups. Live Incus commands used `sg incus`; launch the installed app after a fresh login for ordinary socket access. `incus-admin` was not added.
@@ -49,7 +94,7 @@ The integrated VTE terminal is covered by the GTK mock flow and argv/environment
 - The restricted egress helper and Squid are separate from the GTK process. Normal networking remains unfiltered; only the restricted policy applies the tested domain/port allowlist.
 - Custom bridge selection enumerates managed Incus bridges and does not create or alter host networks. The 0.3.9 Squid ACL integration above is local-only and does not validate LAN-only routing to a real private subnet or host route.
 
-## Not verified or out of scope
+### Limitações registradas no snapshot histórico
 
 - Visual login and an interactive session inside GNOME, KDE, or XFCE guests.
 - Behavior on every Incus version, cloud image, storage driver, bridge topology, or host firewall.

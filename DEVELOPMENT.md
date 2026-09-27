@@ -1,50 +1,69 @@
 # Desenvolvimento
 
-Para verificar a cópia única sem dados pessoais: `python3 -m pytest -q tests/test_copies.py`. Com acesso autorizado ao projeto Incus restrito e a imagem Ubuntu 24.04 disponível, `sg incus -c 'PYTHONPATH=. python3 scripts/live-copy-smoke.py'` cria uma VM descartável, confere o hash no guest e a remove ao sair. O script usa apenas conteúdo sintético.
+Este guia cobre a execução local, a suíte automatizada e os smokes que criam VMs descartáveis. Os testes unitários/GTK não exigem daemon Incus; os scripts `live-*` exigem um host configurado e autorização deliberada. O [registro de validação](docs/LIVE-VALIDATION.md) informa o que já foi exercitado.
 
-`python3 -m pytest -q tests/test_snapshot_policy.py` cobre a preferência e a ordem da proteção. Com o mesmo acesso Incus, `sg incus -c 'PYTHONPATH=. python3 scripts/live-protection-snapshot-smoke.py'` cria uma VM descartável parada, toma um snapshot e só então altera a CPU; o script a remove ao sair.
+## Dependências
 
-`tests/test_model.py` cobre exportação create-only, versões numeradas e round-trip de importação sem conexão Incus.
-
-`tests/test_software_inventory.py` cobre os parsers de APT, pip, pipx, npm, Cargo, Go e Rust, estados ausentes/divergentes e que a consulta real usa apenas comandos separados e validados. A verificação do guest só percorre pacotes do manifesto local de uma VM IsolateVM em execução.
-
-`tests/test_incus.py` verifica o argv fechado do terminal Incus e que o cliente interativo recebe ambiente mínimo, sem variáveis secretas do host. Os testes GTK confirmam que o modo mock não abre um processo de terminal.
-
-Com acesso deliberado ao projeto Incus restrito e a imagem Ubuntu 24.04 em cache, `sg incus -c 'PYTHONPATH=. python3 scripts/live-software-inventory-smoke.py'` cria uma VM offline descartável, consulta APT sem instalar pacotes e remove a VM ao sair. Esse smoke não valida inventário real dos demais gerenciadores.
-
-`tests/test_change_diff.py` cobre as prévias de recursos, mounts, rede e dispositivos. O smoke GTK verifica os botões Cancelar/Aplicar e recusa uma prévia obsoleta. O script `live-protection-snapshot-smoke.py` também confere o diff de CPU/RAM contra uma configuração Incus real, usando uma imagem Ubuntu 24.04 já presente no cache local.
-
-O smoke GTK `test_disposable_close_requires_confirmation_and_deletes_only_after_apply` percorre o fluxo de fechamento com serviço simulado: cancelar mantém a VM; confirmar remove VM, manifesto local e registra a auditoria. O teste também aciona o handler de fechamento usando um adapter confinado simulado.
-
-## Dependências no Ubuntu
+Em Ubuntu:
 
 ```bash
-sudo apt install python3 python3-gi python3-yaml \
-  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 python3-pytest python3-secretstorage squid
+sudo apt install python3 python3-gi python3-yaml python3-pytest \
+  python3-secretstorage gir1.2-gtk-4.0 gir1.2-adw-1 \
+  gir1.2-vte-3.91 squid xvfb
 ```
 
-Para os testes gráficos em um ambiente sem sessão de desktop, instale `xvfb` e execute `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`. A suíte não precisa de daemon Incus. Os testes de ACL iniciam Squid localmente com `hosts_file` sintético; não conectam a uma VM ou bridge Incus.
+O Squid é usado nos testes de ACL com resolver sintético. O Xvfb fornece a sessão gráfica dos smoke tests GTK em CI.
 
-## Executar e validar
+## Fluxo rápido
 
 ```bash
 ISOLATEVM_MOCK=1 python3 -m isolatevm
+python3 -m compileall -q isolatevm packaging/isolatevm-egress-helper.py packaging/guest
 python3 -m pytest -q
-python3 -m compileall -q isolatevm
 ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q
 ./scripts/build-deb.sh
 ```
 
-Nunca execute a interface GTK como root. Testes reais de integração precisam de um serviço Incus configurado deliberadamente e acesso apropriado ao usuário; revise o projeto-alvo e os efeitos antes de executá-los. O backend mock é a opção segura para desenvolver a interface.
+O mock mantém VMs em memória e não conecta ao daemon. **Nunca execute a interface GTK como root.**
 
-## Contratos de implementação
+## Mapa dos testes
 
-- `isolatevm.model.Manifest` valida manifestos versão 1 e rejeita campos desconhecidos.
-- `isolatevm.incus.IncusService` separa a interface do backend Incus; `MockIncus` implementa o mesmo contrato para testes.
-- `isolatevm.api.IncusUnixApi` faz consultas REST locais permitidas.
-- `LocalIncus` usa arrays de argumentos em vez de strings shell e configura explicitamente os dispositivos de armazenamento e rede das VMs.
-- cloud-init instala software e helpers estáticos dentro do guest. Valores de secrets são buscados no Secret Service apenas após confirmação separada e enviados por stdin do agente Incus para tmpfs `/run`; nunca copie credenciais do host durante a criação.
-- O Incus é a fonte de verdade do estado real da VM; um manifesto salvo descreve a configuração solicitada/criada e pode divergir após edições externas.
-- Actions de terceiros no CI devem usar SHA completo e comentário de release. O workflow atual fixa `actions/checkout` em v7.0.1 e usa apenas `contents: read`.
+| Área | Testes | Evidência fornecida |
+| --- | --- | --- |
+| Manifesto e armazenamento | `tests/test_model.py` | Schema, import/export, nomes versionados, log limitado, concorrência e erro de escrita |
+| Egress | `tests/test_egress.py` | Regras, DNS sintético, falhas parciais e estado do helper |
+| Incus e terminal | `tests/test_incus.py` | Argumentos tipados, seleção de CPU, ambiente do cliente e operações mock |
+| Cópia única e snapshots | `tests/test_copies.py`, `tests/test_snapshot_policy.py` | Limites, recibos e ordem da proteção |
+| Inventário e prévia | `tests/test_software_inventory.py`, `tests/test_change_diff.py` | Consultas somente leitura e diff de estado relevante |
+| Interface | `tests/test_ui_smoke.py` | Fluxos GTK sob sessão gráfica, incluindo log cheio e fechamento confirmado |
 
-Antes de criar uma VM real, verifique o alias da imagem, pool, bridge, limites de recursos, mounts e política de egress solicitada na revisão do aplicativo. Mounts e acesso à rede devem permanecer explícitos.
+A suíte automatizada não demonstra comportamento em todos os drivers, versões Incus, políticas do host ou hardware físico. O CI em Ubuntu 24.04 executa compileall, suíte GTK sob Xvfb, construção do pacote e inspeção de metadados.
+
+## Testes com Incus real
+
+Os comandos abaixo pressupõem acesso autorizado ao projeto Incus restrito, imagem Ubuntu 24.04 disponível e revisão prévia do pool, bridge e efeitos. Os scripts usam dados sintéticos e tentam excluir suas VMs descartáveis ao sair; uma interrupção pode exigir inspeção manual.
+
+```bash
+sg incus -c 'PYTHONPATH=. python3 scripts/live-copy-smoke.py'
+sg incus -c 'PYTHONPATH=. python3 scripts/live-protection-snapshot-smoke.py'
+sg incus -c 'PYTHONPATH=. python3 scripts/live-software-inventory-smoke.py'
+```
+
+| Script | Verificação principal |
+| --- | --- |
+| `live-copy-smoke.py` | Cópia única e SHA-256 no guest |
+| `live-protection-snapshot-smoke.py` | Snapshot antes de alterar CPU e comparação com estado Incus |
+| `live-software-inventory-smoke.py` | Consulta APT em uma VM offline; não valida todos os gerenciadores |
+
+O [registro de validação](docs/LIVE-VALIDATION.md) contém outros fluxos live da revisão 0.3.10 e suas condições, separados dos smokes acima.
+
+## Contratos para alterações
+
+- `Manifest` mantém `schemaVersion: 1`, valida campos conhecidos e recusa valores fora dos limites.
+- `IncusService` separa a interface do backend; `MockIncus` fornece o mesmo contrato para testes sem daemon. `IncusUnixApi` restringe consultas REST locais.
+- `LocalIncus` usa vetores de argumentos, configuração local explícita e valida novamente instâncias, recursos e dispositivos antes de operações sensíveis.
+- A configuração `cloud-init` instala software dentro do guest. Secrets só são recuperados após ação explícita e enviados por stdin para tmpfs `/run`; credenciais do host não são copiadas na criação.
+- Incus é a fonte de verdade da configuração efetiva. Manifestos locais descrevem a escolha da aplicação e podem divergir após edições externas.
+- Actions de terceiros no CI usam SHA completo e permissões mínimas. O workflow atual fixa `actions/checkout` em v7.0.1 com `contents: read`.
+
+Antes de propor mudanças de rede, dispositivos ou armazenamento, atualize testes que cubram falhas parciais e os limites declarados em [SECURITY.md](SECURITY.md).

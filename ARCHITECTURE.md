@@ -1,20 +1,34 @@
-# IsolateVM: arquitetura e plano
+# Arquitetura do IsolateVM
+
+O IsolateVM separa interface, validação, operações Incus e integração privilegiada de rede. Este documento descreve os fluxos implementados e seus limites; o [modelo de segurança](SECURITY.md) detalha ameaças e o [registro de validação](docs/LIVE-VALIDATION.md) indica quais caminhos foram testados em host real.
+
+## Navegação
+
+- [Visão geral e limites](#visão-geral-e-limites)
+- [Fluxos operacionais](#fluxos-operacionais)
+- [Fronteiras de confiança](#fronteiras-de-confiança)
+- [Fluxo de criação](#fluxo-de-criação)
+- [Estado dos componentes](#estado-dos-componentes)
+- [Histórico local](#histórico-local)
+- [Referências verificadas](#referências-verificadas)
+
+## Visão geral e limites
+
+Aplicativo local para VMs Incus no Ubuntu. A interface GTK4/libadwaita executa como usuário comum. O backend Python é separado da interface, expõe apenas operações tipadas, valida os dados novamente e chama um adaptador `IncusService`. A configuração declarativa tem `schemaVersion: 1`. Incus é a fonte de verdade para estado, recursos e dispositivos; os templates são arquivos locais.
+
+O backend usa REST sobre o socket administrativo para consultas de instâncias, pools e redes. No socket de usuário restrito, as leituras também usam o cliente `incus` para preservar a seleção automática do projeto `user-<uid>`. O cliente `incus` é usado para criação com imagem remota, alterações de estado, dispositivos, snapshots e terminal; cada chamada usa `subprocess.run` com vetor de argumentos, sem shell. A interface não recebe um canal de execução genérica.
+
+### Decisão de stack
+
+A implementação usa GTK4/libadwaita e PyGObject para manter a interface nativa ao Ubuntu e o backend em Python. O contrato de serviço separa UI e operações Incus, permitindo que a interface evolua sem expor comandos genéricos.
+
+## Fluxos operacionais
 
 Para alterações em VMs existentes, `change_diff.py` gera uma prévia de antes/depois a partir da configuração Incus efetiva. A UI busca novamente essa configuração antes de aplicar e rejeita uma prévia obsoleta; o backend mantém suas próprias validações. O snapshot opcional de proteção é criado após essa verificação e antes da mutação. A comparação cobre os campos envolvidos na operação, não afirma que todo o host ou guest permaneceu imutável.
 
 Os modos `delete-on-close`, `restore-initial-on-close` e `persist-workspace` são confirmados no evento normal de fechamento da janela. A ação exige correspondência entre manifesto local e marcadores Incus na VM sem perfis herdados; o modo de volume também valida o dispositivo `/workspace`, a propriedade e o tamanho do volume separado. Instâncias não verificáveis são mantidas. `persist-workspace` restaura o snapshot reservado do disco da VM e preserva o volume customizado; snapshots e backups da VM não incluem seus dados. Clones desse modo recebem uma cópia independente do volume; os demais clones continuam persistentes. O encerramento abrupto do processo/host não executa as ações de fechamento.
 
 Para cópias únicas, o manifesto guarda apenas origem/destino/tipo e a confirmação de arquivos ocultos. O adaptador confere o estado gerenciado da VM e lê cada arquivo por descritores com `O_NOFOLLOW`; o agente Incus leva os bytes por stdin ao helper estático criado no guest pelo cloud-init. O helper cria somente arquivos novos no disco raiz, verifica SHA-256 e aceita repetição com conteúdo idêntico. O estado `pending`/`done` e um digest de recibo ficam na configuração Incus. A cópia não concede um mount contínuo e não sincroniza alterações posteriores.
-
-## Objetivo e limites
-
-Aplicativo local para VMs Incus no Ubuntu. A interface GTK4/libadwaita executa como usuário comum. O backend Python é separado da interface, expõe apenas operações tipadas, valida os dados novamente e chama um adaptador `IncusService`. A configuração declarativa tem `schemaVersion: 1`. Incus é a fonte de verdade para estado, recursos e dispositivos; os templates são arquivos locais.
-
-O primeiro corte usa REST sobre o socket administrativo para consultas de instâncias, pools e redes. No socket de usuário restrito, as leituras também usam o cliente `incus` para preservar a seleção automática do projeto `user-<uid>`. O cliente `incus` é usado para criação com imagem remota, alterações de estado, dispositivos, snapshots e terminal; cada chamada usa `subprocess.run` com vetor de argumentos, sem shell. A interface não recebe um canal de execução genérica.
-
-### Decisão de stack
-
-A implementação usa GTK4/libadwaita e PyGObject para manter a interface nativa ao Ubuntu e o backend em Python. O contrato de serviço separa UI e operações Incus, permitindo que a interface evolua sem expor comandos genéricos.
 
 ## Fronteiras de confiança
 
@@ -26,13 +40,13 @@ A implementação usa GTK4/libadwaita e PyGObject para manter a interface nativa
 
 ## Fluxo de criação
 
-O wizard percorre nome, sistema, hardware, disco, rede, acesso ao host, software, ferramentas, variáveis públicas e referências de secrets, preview de provisionamento, segurança, revisão e criação. `editar → validar → revisão/dry run → confirmar → criar (parada) → aplicar dispositivos/configuração → iniciar → auditar`. Caso uma etapa intermediária falhe, o backend tenta apagar a VM que acabou de criar e registra se a limpeza falhou. Nunca apaga uma VM preexistente. Segredos não são enviados durante a criação: uma ação separada recupera valores do Secret Service e, por stdin do agente Incus, preenche arquivos temporários em `/run`.
+O wizard percorre nome, sistema, hardware, disco, rede, acesso ao host, software, ferramentas, variáveis públicas e referências de secrets, preview de provisionamento, segurança, revisão e criação. O fluxo é `editar → validar → revisão/dry run → confirmar → criar e configurar a VM parada → salvar manifesto local → registrar auditoria`. O start é uma ação posterior. Uma falha do histórico depois da criação é apresentada como aviso e não impede o salvamento do manifesto. Caso uma etapa intermediária falhe, o backend tenta apagar a VM que acabou de criar e registra se a limpeza falhou. Nunca apaga uma VM preexistente. Segredos não são enviados durante a criação: uma ação separada recupera valores do Secret Service e, por stdin do agente Incus, preenche arquivos temporários em `/run`.
 
 O dry run reaproveita o preflight do serviço, lê metadados da imagem e, se o socket permitir, `GET /1.0/storage-pools/<pool>/resources`. A aplicação não estima o uso físico inicial a partir do limite lógico do disco; informa capacidade ausente quando a consulta de pool não está disponível. O plano não executa operações de escrita nem cria recursos.
 
 A etapa **AI Coding** converte seleções para campos npm/pipx do manifesto, sem um canal próprio de execução. npm e pipx rodam como `ubuntu` dentro do guest; npm usa prefixo `/home/ubuntu/.local`. Nenhuma sessão, chave ou arquivo de autenticação do host é copiado. O login é feito pelo usuário dentro da VM, ou um secret explicitamente referenciado é passado ao processo escolhido. Aider 0.86.2 requer Python 3.10–3.12 e é recusado para Ubuntu 26.04.
 
-## Fases
+## Estado dos componentes
 
 - **Fase 1:** diagnóstico, listagem, estado, criação Ubuntu, recursos, mounts e auditoria. Terminal externo e terminal integrado VTE sobre `incus exec`.
 - **Fase 2:** manifesto versionado, templates locais, `cloud-init` para APT, snapshots, clone e import/export.
@@ -47,6 +61,10 @@ O detalhe de cada VM é organizado em abas de visão geral, hardware, armazename
 
 Na tela **Permissões efetivas**, a ação de inventário executa consultas fixas por gerenciador para os itens do manifesto local: `dpkg-query`, pip/pipx/npm, `cargo install --list`, metadados Go e `rustc --version`. Ela não instala nem remove pacotes. A consulta precisa de uma VM ligada e do agente Incus. Versões são afirmações do guest, não prova de integridade ou procedência; pacotes acrescentados fora do manifesto não aparecem nessa lista.
 
+## Histórico local
+
+O histórico local usa append com limite de 16 MiB: valida o inode sem seguir links, adquire lock exclusivo, revalida o tamanho total, grava um evento JSON delimitado e executa `fsync`. Uma escrita incompleta seguida de erro tenta restaurar o tamanho anterior sob o mesmo lock. A leitura usa lock compartilhado. O histórico é um registro operacional resistente à concorrência entre escritores cooperantes, mas não é inviolável contra o usuário proprietário, nem garante recuperação automática após interrupção abrupta ou falha de disco. Quando atinge o limite, a interface avisa da ausência de registro sem confundir a ação Incus já concluída com uma falha.
+
 ## Referências verificadas
 
 - [Incus REST API](https://linuxcontainers.org/incus/docs/main/rest-api/) e [especificação](https://linuxcontainers.org/incus/docs/main/rest-api-spec/)
@@ -58,5 +76,3 @@ Na tela **Permissões efetivas**, a ação de inventário executa consultas fixa
 - [ACL de rede](https://linuxcontainers.org/incus/docs/main/howto/network_acls/)
 
 O backend verifica versão e erros do cliente Incus instalado em tempo de execução.
-
-O histórico local usa um protocolo de append limitado e sincronizado: valida o inode sem seguir links, adquire lock exclusivo, revalida o limite total, grava um evento JSON delimitado e executa `fsync`. A leitura usa lock compartilhado. Ele é um registro operacional resistente a escritas concorrentes e arquivos especiais, não uma fonte de auditoria confiável contra o usuário proprietário.

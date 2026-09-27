@@ -1,21 +1,47 @@
-# Pacote Ubuntu
+# Empacotamento Ubuntu
 
-Gerar `.deb` sem root:
+A versão 0.3.11 é distribuída como fonte; o `.deb` é construído localmente a partir da tag/checkout correspondente. O pacote instala uma interface de usuário comum e um helper Polkit separado para políticas de rede restrita. **Instalar o pacote não configura Incus nem concede permissões Incus ao usuário.**
+
+## Construir e inspecionar
 
 ```bash
 ./scripts/build-deb.sh
+dpkg-deb --field dist/isolatevm_0.3.11_all.deb Package Version Architecture
+dpkg-deb --contents dist/isolatevm_0.3.11_all.deb
 ```
 
-O pacote sai em `dist/isolatevm_0.3.10_all.deb`. Inspecione com `dpkg-deb --contents` antes da instalação. O launcher executa como usuário comum. A rede restrita instala um helper Polkit separado que só configura proxy por VM e regras nftables geradas de regras validadas. O pacote inclui helpers estáticos usados pela entrega de secrets em `/run`, pela cópia única ao disco do guest e pela instalação opcional de ferramentas DevOps nos guests; depende de `python3-secretstorage`, e um provedor Secret Service da sessão do usuário, como GNOME Keyring, é necessário para armazenar valores. O terminal integrado requer `gir1.2-vte-3.91`, o widget VTE construído para GTK4.
+O script não requer root e grava o resultado em `dist/`, fora do Git. Confira conteúdo e dependências antes de instalar:
 
-O pacote depende dos bindings GTK4/libadwaita/PyYAML disponíveis nos repositórios Ubuntu. Incus é opcional no pacote para permitir diagnóstico e modo mock antes de uma configuração consciente do host.
+```bash
+sudo apt install ./dist/isolatevm_0.3.11_all.deb
+dpkg-query -W isolatevm
+dpkg -V isolatevm
+```
 
-O pacote `0.3.10` foi construído, inspecionado e instalado neste host. A matriz local usou o `.deb` anterior `0.3.8`, gerado de um checkout local, e executou downgrade, upgrade para `0.3.10`, reinstall da mesma versão, remove, purge e fresh install de `0.3.10`. A remoção foi testada sem política ativa; como o pacote não tem conffiles, `dpkg -r` removeu o registro e os arquivos do pacote, e o `dpkg -P` seguinte não tinha estado remanescente para purgar. A instalação posterior concluiu e `/usr/bin/python3` importou `0.3.10` de `/usr/lib/python3/dist-packages/isolatevm`. O launcher iniciou em modo mock sob Xvfb; terminou apenas pelo limite externo de 8 segundos. `dpkg -V isolatevm` não reportou divergências. Launcher e helper privilegiado são `0755`; demais arquivos empacotados são `0644`; diretórios `0755`.
+O launcher deve ser aberto na sessão do usuário, sem `sudo`. Incus é opcional como dependência do pacote para permitir diagnóstico e modo mock antes da configuração do host. Operações reais requerem cliente/daemon Incus, projeto, pool, bridge quando aplicável e permissões apropriadas.
 
-Durante a política `restricted` ativa, `dpkg -r isolatevm` foi recusado pelo `prerm`; state e firewall permaneceram ativos. Depois da remoção segura da VM/política, o pacote pôde ser removido. Arquivos de estado fora da lista do pacote não são apagados: o state de egress terminou `{}`, os locks root-only permaneceram sob `/var/lib/isolatevm/egress`, os diretórios de config/log ficaram vazios, e `/etc/modules-load.d/isolatevm-br-netfilter.conf` foi preservado. Os dois arquivos existentes em `~/.local/share/isolatevm` mantiveram hashes e modo `0600` durante remove/purge/fresh install.
+## Conteúdo e dependências
 
-A proteção de `main` foi aplicada e confirmada no GitHub: exige pull request, check `test-and-package` verde, branch atualizada antes do merge e bloqueia force-push e exclusão; também vale para administradores. A regra não exige aprovação de outra pessoa (`0` aprovações), para manter o fluxo utilizável por um único mantenedor. Ela é uma configuração remota do repositório, independente do `.deb`.
+| Parte | Finalidade |
+| --- | --- |
+| `/usr/bin/isolatevm` e módulos Python | Interface GTK4/libadwaita, backend, modelo e provisionamento |
+| Helper de egress + policy Polkit | Operações enumeradas e autorizadas para proxy por VM e nftables |
+| Units systemd de egress | Restauração da política antes da inicialização Incus quando uma política restrita existe |
+| Helpers estáticos do guest | Cópia única, secrets em `/run` e instalação opcional de ferramentas no guest |
+| Arquivos desktop e documentação | Integração da aplicação e contratos de operação |
 
-Em hosts onde a política `FORWARD` do Docker bloqueia uma bridge Incus, o operador pode avaliar os arquivos `packaging/isolatevm-docker-forward.*`. Eles não são instalados nem habilitados pelo `.deb`. Inspecione o script e a unidade, crie `/etc/default/isolatevm-docker-forward` com `ISOLATEVM_BRIDGE=incusbr-<id>` usando a bridge real, e confirme que as regras correspondem à política do host antes de habilitar o serviço. A desativação do serviço remove as regras que ele adiciona.
+O pacote depende dos bindings GTK4/libadwaita, PyYAML, VTE GTK4 (`gir1.2-vte-3.91`) e `python3-secretstorage` dos repositórios Ubuntu. Para guardar valores de secrets é necessário um provedor Secret Service na sessão, como GNOME Keyring. O console VGA é opcional e requer `virt-viewer` (`remote-viewer`) ou outro cliente SPICE compatível.
 
-Para a console VGA de VMs em execução, instale `virt-viewer` (fornece `remote-viewer`) ou um cliente SPICE compatível. O pacote apenas sugere essa dependência; o dashboard desativa a ação quando ela está ausente.
+## Remoção e dados persistentes
+
+Uma remoção com política de egress restrito ativa é recusada pelo `prerm` para não retirar o helper enquanto firewall e estado ainda dependem dele. Exclua a VM/política pelo fluxo validado antes de remover o pacote. O pacote não apaga automaticamente dados externos à sua lista de arquivos, como configurações e históricos do usuário ou estado root-only de egress.
+
+No ciclo de validação da **0.3.10**, foram exercitados downgrade de um pacote local 0.3.8, upgrade, reinstall, remove, purge e fresh install. `dpkg -V` não reportou divergências após a instalação; o launcher iniciou em modo mock sob Xvfb. Também foi comprovada a recusa de `dpkg -r` com política ativa, preservando state e firewall. Os arquivos de configuração do usuário mantiveram modo `0600` e hashes. Esses resultados pertencem ao host e à versão documentados em [LIVE-VALIDATION.md](docs/LIVE-VALIDATION.md); o pacote 0.3.11 recebeu CI, sem repetição completa da matriz live.
+
+## Integração opcional com Docker
+
+Em hosts onde a política `FORWARD` do Docker bloqueia uma bridge Incus, avalie `packaging/isolatevm-docker-forward.*`. Esses arquivos **não** são instalados nem habilitados pelo `.deb`. Revise o script e a unit, defina `ISOLATEVM_BRIDGE=incusbr-<id>` em `/etc/default/isolatevm-docker-forward` com a bridge real e confira as regras frente à política do host antes de habilitar o serviço. A desativação remove as regras adicionadas por ele.
+
+## Evidência de distribuição
+
+O CI compila, executa testes sob Xvfb, constrói o `.deb` e inspeciona Package/Version/Architecture. Isso verifica empacotamento e testes automatizados; não comprova uma instalação ou reboot físico em cada host. Consulte [README.md](README.md) para requisitos e [SECURITY.md](SECURITY.md) para o impacto de rede e privilégios.

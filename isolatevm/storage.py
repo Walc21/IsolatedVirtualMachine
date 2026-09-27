@@ -69,13 +69,24 @@ def audit(action: str, vm: str, result: str, source: str = "gui") -> None:
                 info.st_nlink != 1 or info.st_size + len(encoded) > MAX_AUDIT_BYTES):
             raise ValidationError("Arquivo de auditoria inválido ou acima do limite")
         os.fchmod(fd, 0o600)
-        view = memoryview(encoded)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise ValidationError("Não foi possível gravar o registro de auditoria completo")
-            view = view[written:]
-        os.fsync(fd)
+        original_size = info.st_size
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise ValidationError("Não foi possível gravar o registro de auditoria completo")
+                view = view[written:]
+            os.fsync(fd)
+        except (OSError, ValidationError):
+            # A short write followed by an error must not poison the JSONL tail.
+            try:
+                os.ftruncate(fd, original_size)
+                os.fsync(fd)
+            except OSError:
+                # The original failure is more useful; the file may need repair.
+                pass
+            raise
     finally:
         os.close(fd)
 

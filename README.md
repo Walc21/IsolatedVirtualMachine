@@ -1,6 +1,6 @@
 <div align="center">
 
-# LOCKDOWN
+# ISOLATE VIRTUAL MACHINE
 ### IsolateVM · gestão local e revisável de máquinas virtuais Incus
 
 [![CI](https://github.com/Walc21/LOCKDOWN/actions/workflows/ci.yml/badge.svg)](https://github.com/Walc21/LOCKDOWN/actions/workflows/ci.yml)

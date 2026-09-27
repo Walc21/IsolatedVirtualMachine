@@ -58,3 +58,5 @@ Na tela **Permissões efetivas**, a ação de inventário executa consultas fixa
 - [ACL de rede](https://linuxcontainers.org/incus/docs/main/howto/network_acls/)
 
 O backend verifica versão e erros do cliente Incus instalado em tempo de execução.
+
+O histórico local usa um protocolo de append limitado e sincronizado: valida o inode sem seguir links, adquire lock exclusivo, revalida o limite total, grava um evento JSON delimitado e executa `fsync`. A leitura usa lock compartilhado. Ele é um registro operacional resistente a escritas concorrentes e arquivos especiais, não uma fonte de auditoria confiável contra o usuário proprietário.

@@ -350,6 +350,22 @@ def test_history_rejects_non_event_json_records(tmp_path, monkeypatch):
         history()
 
 
+def test_audit_bounds_metadata_and_never_appends_past_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    with pytest.raises(ValidationError, match="Metadados"):
+        audit("start", "v" * 129, "ok")
+    with pytest.raises(ValidationError, match="Metadados"):
+        audit("start", "dev-vm", "ok", source="s" * 65)
+
+    audit("start", "dev-vm", "ok")
+    path = tmp_path / "data" / "isolatevm" / "audit.jsonl"
+    original = path.read_bytes()
+    monkeypatch.setattr("isolatevm.storage.MAX_AUDIT_BYTES", len(original))
+    with pytest.raises(ValidationError, match="acima do limite"):
+        audit("stop", "dev-vm", "ok")
+    assert path.read_bytes() == original
+
+
 def test_saved_network_bridge_reads_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     manifest = Manifest.parse(sample(network={"mode": "normal", "bridge": "incusbr0"}))

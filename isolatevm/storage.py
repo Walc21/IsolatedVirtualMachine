@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -52,19 +53,31 @@ def data_dir() -> Path:
 def audit(action: str, vm: str, result: str, source: str = "gui") -> None:
     if action not in {"create", "start", "stop", "restart", "delete", "snapshot", "snapshot-restore", "snapshot-delete", "mount-add", "mount-remove", "usb-add", "usb-remove", "gpu-add", "gpu-remove", "pci-add", "pci-remove", "disk-volume-add", "disk-volume-delete", "network-block", "network-restore", "resources", "disk-grow", "cpu-pin", "clone", "template", "export", "backup-full", "backup-workspace", "backup-data-volume", "secret-store", "secret-delete", "secret-inject", "secret-clear", "copy-files", "disposable-retain"}:
         raise ValidationError("Ação de auditoria desconhecida")
+    if (not isinstance(vm, str) or not vm or len(vm) > 128 or
+            not isinstance(source, str) or not source or len(source) > 64):
+        raise ValidationError("Metadados de auditoria inválidos")
     event = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "action": action, "vm": vm, "result": str(result)[:2048], "source": source}
+    encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     path = data_dir() / "audit.jsonl"
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags, 0o600)
-    info = os.fstat(fd)
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
-            info.st_nlink != 1 or info.st_size > MAX_AUDIT_BYTES):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                info.st_nlink != 1 or info.st_size + len(encoded) > MAX_AUDIT_BYTES):
+            raise ValidationError("Arquivo de auditoria inválido ou acima do limite")
+        os.fchmod(fd, 0o600)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise ValidationError("Não foi possível gravar o registro de auditoria completo")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
         os.close(fd)
-        raise ValidationError("Arquivo de auditoria inválido ou acima do limite")
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def history(limit: int = 200) -> list[dict]:
@@ -74,6 +87,7 @@ def history(limit: int = 200) -> list[dict]:
     fd = -1
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fcntl.flock(fd, fcntl.LOCK_SH)
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
                 info.st_nlink != 1 or info.st_size > MAX_AUDIT_BYTES):

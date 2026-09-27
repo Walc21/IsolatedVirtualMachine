@@ -14,7 +14,7 @@ Este registro separa resultados obtidos no Incus local, testes automatizados e i
 ## Atualização para 0.3.11 — 2026-09-27
 
 - [PR #10](https://github.com/Walc21/LOCKDOWN/pull/10) introduziu lock de arquivo, limite e sincronização do histórico local. [PR #11](https://github.com/Walc21/LOCKDOWN/pull/11) preservou manifesto e confirmação de operações quando a auditoria falha e acrescentou testes de concorrência, erro parcial e log cheio na interface.
-- O [CI do PR #11](https://github.com/Walc21/LOCKDOWN/actions/runs/36337685354) concluiu com sucesso compileall, testes unitários/GTK, construção e inspeção do pacote. O pacote renomeado 0.3.11 requer o CI da branch de documentação/release; esse resultado será registrado no PR correspondente.
+- O [CI do PR #11](https://github.com/Walc21/LOCKDOWN/actions/runs/36337685354) concluiu com sucesso compileall, testes unitários/GTK, construção e inspeção do pacote. O [CI do PR #12](https://github.com/Walc21/LOCKDOWN/actions/runs/36338863279) concluiu com sucesso a suíte unitária/GTK, compilação e construção/inspeção do pacote 0.3.11.
 - Não houve nova validação com VM real, reboot ou hardware após o ciclo live descrito a seguir. As observações da 0.3.10 permanecem evidência daquele ambiente e não são reclassificadas como teste live da 0.3.11.
 
 ## Candidato 0.3.10 — validação de 2026-09-25

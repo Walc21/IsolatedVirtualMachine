@@ -201,7 +201,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
 
             def saved(result: object) -> None:
                 try: audit("secret-store", "host-vault", "ok")
-                except OSError: pass
+                except (OSError, ValidationError): pass
                 on_saved(str(result))
 
             self._work(store, saved)
@@ -516,7 +516,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
         elif response == Gtk.ResponseType.CLOSE:
             for name, _, _ in targets:
                 try: audit("disposable-retain", name, "retida", source="close-dialog")
-                except OSError: pass
+                except (OSError, ValidationError): pass
             self._allow_close = True
             self.close()
         elif response == Gtk.ResponseType.APPLY:
@@ -574,7 +574,7 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
             try:
                 action = "delete" if disposition == "delete-on-close" else "snapshot-restore"
                 audit(action, name, "ok" if operation_ok else "erro", source="auto-close")
-            except OSError:
+            except (OSError, ValidationError):
                 issues.append(f"{name}: falha ao registrar auditoria")
         return applied, issues
 
@@ -609,18 +609,18 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
                         self.service.snapshot(name, snapshot)
                     except Exception:
                         try: audit("snapshot", name, "erro", source="auto")
-                        except OSError: pass
+                        except (OSError, ValidationError): pass
                         raise
                     try: audit("snapshot", name, "ok", source="auto")
-                    except OSError: pass
+                    except (OSError, ValidationError): pass
                     GLib.idle_add(self._toast, f"Snapshot de proteção criado: {snapshot}")
                 fn()
             except Exception:
                 try: audit(action, name, "erro")
-                except OSError: pass
+                except (OSError, ValidationError): pass
                 raise
             try: audit(action, name, "ok")
-            except OSError as exc:
+            except (OSError, ValidationError) as exc:
                 GLib.idle_add(self._toast, f"Operação concluída; auditoria local falhou: {exc}")
         self._work(run, lambda *_: (done or self.show_dashboard)())
 
@@ -692,7 +692,10 @@ class IsolateWindow(WizardMixin, DetailsMixin, MetricsMixin, TerminalMixin, Gtk.
     def _export_versioned(self, manifest: Manifest) -> None:
         def run() -> Path:
             path = export_manifest_versioned(manifest, Path.home())
-            audit("export", manifest.name, "ok")
+            try:
+                audit("export", manifest.name, "ok")
+            except (OSError, ValidationError) as exc:
+                GLib.idle_add(self._toast, f"Manifesto salvo; auditoria local falhou: {exc}")
             return path
         self._work(run, lambda path: self._toast(f"Nova versão salva em {path}"))
 

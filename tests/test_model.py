@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -364,6 +367,40 @@ def test_audit_bounds_metadata_and_never_appends_past_limit(tmp_path, monkeypatc
     with pytest.raises(ValidationError, match="acima do limite"):
         audit("stop", "dev-vm", "ok")
     assert path.read_bytes() == original
+
+
+def test_audit_concurrent_writers_keep_complete_records(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    labels = [f"writer-{index}" for index in range(240)]
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(lambda label: audit("start", label, "ok"), labels))
+    entries = history(limit=300)
+    assert len(entries) == len(labels)
+    assert {entry["vm"] for entry in entries} == set(labels)
+
+
+def test_audit_rolls_back_partial_write_on_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    audit("start", "first-vm", "ok")
+    path = tmp_path / "data" / "isolatevm" / "audit.jsonl"
+    original = path.read_bytes()
+    real_write = os.write
+    attempts = 0
+
+    def short_then_fail(fd, data):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return real_write(fd, data[:5])
+        raise OSError(errno.ENOSPC, "disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("isolatevm.storage.os.write", short_then_fail)
+        with pytest.raises(OSError, match="disk full"):
+            audit("stop", "second-vm", "ok")
+    assert attempts == 2
+    assert path.read_bytes() == original
+    assert [entry["vm"] for entry in history()] == ["first-vm"]
 
 
 def test_saved_network_bridge_reads_manifest(tmp_path, monkeypatch):

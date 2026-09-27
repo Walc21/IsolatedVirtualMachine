@@ -38,6 +38,14 @@ class CopyEditor:
     include_hidden: Gtk.CheckButton
 
 
+def _audit_issue(action: str, vm: str) -> str | None:
+    try:
+        audit(action, vm, "ok")
+    except (OSError, ValidationError) as exc:
+        return f"auditoria local: {exc}"
+    return None
+
+
 class WizardMixin:
     def _build_wizard(self) -> None:
         self._clear(self.wizard)
@@ -646,15 +654,29 @@ class WizardMixin:
                     self.service.create(manifest, progress)
                 except Exception:
                     try: audit("create", manifest.name, "erro")
-                    except OSError: pass
+                    except (OSError, ValidationError): pass
                     raise
+                issues = []
                 try:
-                    audit("create", manifest.name, "ok")
                     save_instance_manifest(manifest)
-                    if save_template_requested:
-                        save_template_versioned(manifest.name, manifest); audit("template", manifest.name, "ok")
                 except (OSError, ValidationError) as exc:
-                    GLib.idle_add(self._toast, f"VM criada; registro local incompleto: {exc}")
+                    issues.append(f"manifesto local: {exc}")
+                template_saved = False
+                if save_template_requested:
+                    try:
+                        save_template_versioned(manifest.name, manifest)
+                        template_saved = True
+                    except (OSError, ValidationError) as exc:
+                        issues.append(f"template: {exc}")
+                issue = _audit_issue("create", manifest.name)
+                if issue:
+                    issues.append(issue)
+                if template_saved:
+                    issue = _audit_issue("template", manifest.name)
+                    if issue:
+                        issues.append(issue)
+                if issues:
+                    GLib.idle_add(self._toast, "VM criada; registro local incompleto: " + "; ".join(issues))
             finally:
                 GLib.idle_add(self.next_btn.set_sensitive, True)
         def done(_: object) -> None:
@@ -704,16 +726,22 @@ class WizardMixin:
     def _save_template(self, name: str, manifest: Manifest) -> None:
         try:
             path = save_template(name, manifest)
-            audit("template", manifest.name, "ok")
-            self._toast(f"Template salvo em {path}; mounts e fontes de cópia pessoais foram removidos.")
-        except Exception as exc: self._toast(str(exc))
+        except Exception as exc:
+            self._toast(str(exc))
+            return
+        issue = _audit_issue("template", manifest.name)
+        self._toast(f"Template salvo em {path}; mounts e fontes de cópia pessoais foram removidos." +
+                    (f" {issue}" if issue else ""))
 
     def _save_template_versioned(self, name: str, manifest: Manifest) -> None:
         try:
             path = save_template_versioned(name, manifest)
-            audit("template", manifest.name, "ok")
-            self._toast(f"Nova versão de template salva em {path}; caminhos pessoais foram removidos.")
-        except Exception as exc: self._toast(str(exc))
+        except Exception as exc:
+            self._toast(str(exc))
+            return
+        issue = _audit_issue("template", manifest.name)
+        self._toast(f"Nova versão de template salva em {path}; caminhos pessoais foram removidos." +
+                    (f" {issue}" if issue else ""))
 
     def _export_current(self) -> None:
         manifest = self.current_manifest
@@ -723,9 +751,12 @@ class WizardMixin:
 
     def _export_to(self, manifest: Manifest, path: str) -> None:
         try:
-            export_manifest(manifest, Path(path)); audit("export", manifest.name, "ok")
-            self._toast(f"Manifesto salvo em {path}")
-        except Exception as exc: self._toast(str(exc))
+            export_manifest(manifest, Path(path))
+        except Exception as exc:
+            self._toast(str(exc))
+            return
+        issue = _audit_issue("export", manifest.name)
+        self._toast(f"Manifesto salvo em {path}" + (f"; {issue}" if issue else ""))
 
     def show_templates(self) -> None:
         self._clear(self.templates_page)

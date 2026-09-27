@@ -554,3 +554,81 @@ app.run([])
 '''
     env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
     subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+
+@pytest.mark.skipif(os.environ.get("ISOLATEVM_UI_TEST") != "1" or
+                    not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+                    reason="ative ISOLATEVM_UI_TEST=1 em sessão gráfica")
+def test_full_audit_log_does_not_hide_completed_operations_or_manifest(tmp_path):
+    script = '''
+import os
+import traceback
+from pathlib import Path
+from gi.repository import GLib
+from isolatevm.model import Manifest
+import isolatevm.storage as storage
+from isolatevm.ui import IsolateApp
+
+app = IsolateApp()
+messages = []
+errors = []
+events = []
+name = "audit-full-vm"
+storage.MAX_AUDIT_BYTES = 0
+deadline = GLib.get_monotonic_time() + 5_000_000
+
+def begin():
+    window = app.get_active_window()
+    if window is None:
+        return True
+    try:
+        window._toast = messages.append
+        window._error_dialog = lambda exc: errors.append(str(exc))
+        manifest = Manifest.parse({"schemaVersion": 1, "name": name,
+            "os": {"distribution": "ubuntu", "release": "24.04"},
+            "resources": {"cpu": 2, "memoryMiB": 2048, "diskGiB": 20, "pool": "default"},
+            "network": {"mode": "offline"}, "mounts": [], "software": {"apt": []},
+            "security": {"profile": "maximum-isolation"}})
+        window._create(manifest)
+        GLib.timeout_add(25, verify_create)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def verify_create():
+    try:
+        window = app.get_active_window()
+        saved = Path(os.environ["XDG_DATA_HOME"]) / "isolatevm" / "instances" / (name + ".yaml")
+        if not saved.exists():
+            if GLib.get_monotonic_time() > deadline:
+                raise AssertionError("manifest was not saved after audit failure")
+            return True
+        assert any(vm.name == name for vm in window.service.list_vms())
+        window._audited("start", name, lambda: events.append("operation"),
+                        lambda: events.append("done"))
+        GLib.timeout_add(25, verify_audited)
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+def verify_audited():
+    try:
+        if "done" not in events:
+            if GLib.get_monotonic_time() > deadline:
+                raise AssertionError(f"completion callback missing: {errors}")
+            return True
+        assert events == ["operation", "done"]
+        assert errors == []
+        assert any("auditoria local falhou" in message for message in messages)
+        window = app.get_active_window()
+        window.close()
+        app.quit()
+    except BaseException:
+        traceback.print_exc(); os._exit(2)
+    return False
+
+GLib.timeout_add(400, begin)
+app.run([])
+'''
+    env = {**os.environ, "ISOLATEVM_MOCK": "1", "XDG_DATA_HOME": str(tmp_path)}
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=12, env=env)
+

@@ -1,19 +1,34 @@
-# Integration validation summary
+# Registro de validação do IsolateVM
 
-This file records capabilities exercised against a locally configured Incus daemon. These observations are evidence from one test environment, not a guarantee for every Incus version, host policy, image, network, or storage backend. The automated test suite uses mocks and does not replace these live checks.
+Este registro separa resultados obtidos no Incus local, testes automatizados e inspeções de código. As observações pertencem a um ambiente específico; não garantem o mesmo comportamento em todas as versões do Incus, políticas do host, imagens, redes ou backends de armazenamento.
 
-## Release candidate 0.3.10 — validação de 2026-09-25
+## Leitura rápida
 
-Esta seção é o registro autoritativo da validação atual, na branch `codex/isolatevm-release-validation`, iniciada em `8c78fbb5119888ea0d6944ac91d99f81896cf6d5`. As notas posteriores preservam o histórico de revisões anteriores e não descrevem necessariamente o host ou o estado atual.
+| Categoria | Evidência | Limite |
+| --- | --- | --- |
+| Automatizada | Pytest/GTK sob Xvfb, integração Squid sintética, compileall e pacote | Não cria VM no CI |
+| Live do ciclo 0.3.10 | Host Ubuntu 26.04.1, Incus 6.0.5, VMs Ubuntu 24.04 e egress restrito real | Observação de um host, não certificação geral |
+| Patches de auditoria posteriores | Testes de concorrência, falha de escrita e log cheio; CI do PR #11 verde | Sem repetição de toda a matriz live |
+| Ainda pendente | Reboot físico, LAN real, hardware passthrough, desktop interativo e quotas em outros drivers | Não inferir funcionamento desses caminhos |
 
-### AUTOMATED TESTED
+## Atualização para 0.3.11 — 2026-09-27
+
+- [PR #10](https://github.com/Walc21/LOCKDOWN/pull/10) introduziu lock de arquivo, limite e sincronização do histórico local. [PR #11](https://github.com/Walc21/LOCKDOWN/pull/11) preservou manifesto e confirmação de operações quando a auditoria falha e acrescentou testes de concorrência, erro parcial e log cheio na interface.
+- O [CI do PR #11](https://github.com/Walc21/LOCKDOWN/actions/runs/36337685354) concluiu com sucesso compileall, testes unitários/GTK, construção e inspeção do pacote. O pacote renomeado 0.3.11 requer o CI da branch de documentação/release; esse resultado será registrado no PR correspondente.
+- Não houve nova validação com VM real, reboot ou hardware após o ciclo live descrito a seguir. As observações da 0.3.10 permanecem evidência daquele ambiente e não são reclassificadas como teste live da 0.3.11.
+
+## Candidato 0.3.10 — validação de 2026-09-25
+
+Esta seção registra o ciclo de validação live do candidato 0.3.10, iniciado em `8c78fbb5119888ea0d6944ac91d99f81896cf6d5` na branch `codex/isolatevm-release-validation`. As notas abaixo preservam evidência histórica daquele host; commits e CI posteriores são resumidos acima e não equivalem a uma nova execução live.
+
+### Testado automaticamente
 
 - `python3 -m pytest -q`: **320 passed, 7 skipped, 1 warning**.
 - `ISOLATEVM_UI_TEST=1 xvfb-run -a python3 -m pytest -q`: **327 passed, 1 warning**; warning de depreciação do PyGObject em `GLib.unix_signal_add_full`.
 - `python3 -m compileall -q isolatevm packaging/isolatevm-egress-helper.py packaging/guest` e `git diff --check`: passaram.
 - Testes cobrem helper de egress, resposta mista/rebinding e destinos especiais, IP/CIDR explícitos, falhas parciais, confirmação da ausência da VM antes de remover a política, seleção obsoleta de hardware, cópias, variáveis de subprocesso e limites de saída do guest. A suíte não substitui a execução física descrita abaixo.
 
-### LIVE TESTED
+### Testado em host real
 
 - Host Ubuntu 26.04.1 x86_64, Incus 6.0.5 e QEMU 10.2.1. O usuário `victor` usou o socket confinado e o projeto restrito `user-1000`, sem `incus-admin`; `LocalIncus` reconheceu o fallback de pool `isolatevm` e a bridge `incusbr-1000`. IDs de CPU online anunciados: 0–7. Pinning válido em 0–1 foi aplicado em VM parada; seleção offline/stale foi recusada e não alterou a configuração.
 - VMs Ubuntu 24.04 foram criadas pelo backend `LocalIncus` com imagem cloud verificada no cache local. A VM offline tinha `profiles: []`, somente o dispositivo `root`, sem NIC, mounts, secrets ou passthrough; start, restart, agent, `uname`, stop gracioso e exclusão passaram.
@@ -30,7 +45,7 @@ Esta seção é o registro autoritativo da validação atual, na branch `codex/i
 - Terminal PTY real usou argv fixo do cliente Incus, abriu shell como root no guest e executou um marcador de comando dentro da VM; o ambiente do cliente é allowlist. Provisionamento e inventário do pacote `jq` também não receberam variáveis da sessão do host.
 - Inventário somente leitura encontrou 2 GPUs, 6 funções PCI e 7 dispositivos USB. Nenhum dispositivo físico foi anexado.
 
-### INSPECTED
+### Inspecionado
 
 - Unit e drop-in exigem restauração do firewall antes dos serviços Incus; restauração manual foi exercitada. O estado final da política é `{}`, a unit está `inactive/disabled`, não há drop-in nem tabelas nft IsolateVM, e o projeto Incus não contém VMs nem volumes de teste.
 - Catálogo fixa Codex CLI `@openai/codex@0.154.0`, Claude Code `@anthropic-ai/claude-code@2.1.276`, Aider `aider-chat==0.86.2` e OpenCode `opencode-ai@1.18.31`. Testes e inspeção confirmam que npm/pipx são executados como `ubuntu`, npm usa `/home/ubuntu/.local` e o código não importa credenciais do host.
@@ -38,7 +53,7 @@ Esta seção é o registro autoritativo da validação atual, na branch `codex/i
 - `onboarding.done` e `settings.json` do usuário mantiveram tamanhos, modos `0600` e SHA-256 de baseline através de remove/purge/fresh install. O pacote não removeu state externo: state egress `{}`, locks `.lock`/`.operation.lock` root-only, config/log vazios; o módulo `br_netfilter` pré-existente foi preservado. Nenhuma VM/volume/política permaneceu.
 - Fluxos de CI local concluíram (`compileall`, pytest e GTK/Xvfb); a GitHub Action remota NÃO foi iniciada, pois esta branch permaneceu local, sem push/PR. O workflow continua pinado em SHA imutável com `contents: read`.
 
-### NOT TESTED / OUT OF SCOPE
+### Não testado ou fora do escopo
 
 - **Reboot físico do host:** não executado. Foi verificada a ordem das units e feita restauração manual; não há afirmação de ausência de janela de saída após um boot real.
 - **LAN-only real:** sem CIDR/host de LAN apropriado e controlado; apenas validação automatizada das regras RFC1918.

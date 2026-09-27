@@ -17,7 +17,7 @@ chmod 0755 "$stage_dir/usr/bin/isolatevm"
 cp "$project_dir/packaging/org.isolatevm.IsolateVM.desktop" "$stage_dir/usr/share/applications/"
 cp "$project_dir/packaging/org.isolatevm.IsolateVM.svg" "$stage_dir/usr/share/icons/hicolor/scalable/apps/"
 cp "$project_dir/README.md" "$project_dir/ARCHITECTURE.md" "$project_dir/SECURITY.md" \
-   "$project_dir/DEVELOPMENT.md" "$project_dir/PACKAGING.md" \
+   "$project_dir/DEVELOPMENT.md" "$project_dir/PACKAGING.md" "$project_dir/CHANGELOG.md" \
    "$stage_dir/usr/share/doc/isolatevm/"
 cp "$project_dir/docs/MANIFEST.md" "$project_dir/docs/LIVE-VALIDATION.md" \
    "$project_dir/docs/host-init-preseed.yaml" "$stage_dir/usr/share/doc/isolatevm/docs/"
@@ -33,16 +33,17 @@ cp "$project_dir/packaging/isolatevm-egress-firewall.service" "$stage_dir/usr/li
 cp "$project_dir/packaging/org.isolatevm.egress.policy" "$stage_dir/usr/share/polkit-1/actions/"
 cat > "$stage_dir/DEBIAN/control" <<'EOF'
 Package: isolatevm
-Version: 0.3.10
+Version: 0.3.11
 Section: admin
 Priority: optional
 Architecture: all
-Maintainer: IsolateVM Project <local@localhost>
+Maintainer: Walc21 <263046651+Walc21@users.noreply.github.com>
 Depends: python3 (>= 3.11), python3-gi, python3-yaml, python3-secretstorage, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-vte-3.91, nftables, squid, polkitd
 Recommends: incus-client
 Suggests: virt-viewer
-Description: Local graphical manager for Incus virtual machines
- A deny-by-default desktop interface for creating and managing Incus VMs.
+Description: Desktop manager for local Incus Ubuntu virtual machines
+ GTK application with reviewable manifests, offline networking by default,
+ explicit host access and an optional per-VM restricted-egress policy.
 EOF
 cat > "$stage_dir/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
@@ -87,4 +88,4 @@ chmod 0755 "$stage_dir/usr/bin/isolatevm"
 chmod 0755 "$stage_dir/usr/lib/isolatevm/isolatevm-egress-helper"
 chmod 0755 "$stage_dir/DEBIAN/prerm"
 chmod 0755 "$stage_dir/DEBIAN/postinst"
-dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.10_all.deb"
+dpkg-deb --root-owner-group --build "$stage_dir" "$project_dir/dist/isolatevm_0.3.11_all.deb"
